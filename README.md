@@ -89,9 +89,17 @@ Pull requests bienvenidas, especialmente para:
 - Mejorar el parser de Norma 43 con variantes específicas de bancos.
 - Añadir soporte a otros formatos de extracto normalizados (MT940, CAMT.053...).
 
-## Licencia
+## 
+Autor
+S3GAD3
+Autor original y responsable del proyecto RASTRO · COMPANY.
 
-Pendiente de decisión 
+## Licencia
+Este proyecto se distribuye bajo la licencia MIT.
+
+Copyright © 2026 S3GAD3.
+
+La licencia permite usar, copiar, modificar, publicar, distribuir y crear forks, siempre que se conserve el aviso de copyright y el texto de la licencia, manteniendo así la referencia al autor original.
 
 ## Aviso
 
