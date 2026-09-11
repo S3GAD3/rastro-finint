@@ -407,24 +407,51 @@ async function sha256d(bytes){ return sha256(await sha256(bytes)); }
 function parseMoney(value){
   if(typeof value === 'number') return Number.isFinite(value) ? value : 0;
   if(value === null || value === undefined) return 0;
-  let s = String(value).trim();
+  let original = String(value).trim();
+  if(!original) return 0;
+
+  // Convenciones habituales en extractos: -123,45 / 123,45- / (123,45) / 123,45 D o DB.
+  const debitMark = /(?:^|\s)(D|DB|DR|DEBE|CARGO|DEBITO|DÉBITO)(?:\s|$)/i.test(original);
+  const creditMark = /(?:^|\s)(H|HB|CR|CREDITO|CRÉDITO|ABONO|HABER)(?:\s|$)/i.test(original);
+  const negative = /^\s*-/.test(original) || /-\s*(?:[A-Z]{0,3})?\s*$/i.test(original) || /^\s*\(.*\)\s*$/.test(original) || debitMark;
+  let s = original
+    .replace(/\u00a0/g,' ')
+    .replace(/[()]/g,'')
+    .replace(/(?:^|\s)(?:EUR|EUROS?|€|USD|GBP|CHF)(?:\s|$)/gi,' ')
+    .replace(/(?:^|\s)(?:D|DB|DR|DEBE|CARGO|DEBITO|DÉBITO|H|HB|CR|CREDITO|CRÉDITO|ABONO|HABER)(?:\s|$)/gi,' ')
+    .replace(/[^0-9,.'+\-]/g,'')
+    .replace(/'/g,'')
+    .replace(/[+\-]/g,'');
   if(!s) return 0;
-  const negative = /^\s*\(.*\)\s*$/.test(s) || /^\s*-/.test(s) || /-\s*$/.test(s);
-  s = s.replace(/[()]/g,'').replace(/[^0-9,.'-]/g,'').replace(/'/g,'').replace(/-/g,'');
+
   const comma = s.lastIndexOf(','), dot = s.lastIndexOf('.');
   if(comma >= 0 && dot >= 0){
     const decimal = comma > dot ? ',' : '.';
     const thousands = decimal === ',' ? /\./g : /,/g;
     s = s.replace(thousands,'').replace(decimal,'.');
   } else if(comma >= 0){
-    const decimals = s.length - comma - 1;
-    s = decimals === 3 && /^\d{1,3}(,\d{3})+$/.test(s) ? s.replace(/,/g,'') : s.replace(/,/g,'.');
+    const parts = s.split(',');
+    if(parts.length > 2){
+      const last = parts.pop();
+      s = last.length <= 2 ? parts.join('')+'.'+last : parts.join('')+last;
+    } else {
+      const decimals = s.length - comma - 1;
+      s = (decimals === 3 && /^\d{1,3}(,\d{3})+$/.test(s)) ? s.replace(/,/g,'') : s.replace(',','.');
+    }
   } else if(dot >= 0){
-    const decimals = s.length - dot - 1;
-    if(decimals === 3 && /^\d{1,3}(\.\d{3})+$/.test(s)) s = s.replace(/\./g,'');
+    const parts = s.split('.');
+    if(parts.length > 2){
+      const last = parts.pop();
+      s = last.length <= 2 ? parts.join('')+'.'+last : parts.join('')+last;
+    } else {
+      const decimals = s.length - dot - 1;
+      if(decimals === 3 && /^\d{1,3}(\.\d{3})+$/.test(s)) s = s.replace(/\./g,'');
+    }
   }
   const n = Number(s);
-  return Number.isFinite(n) ? (negative ? -Math.abs(n) : n) : 0;
+  if(!Number.isFinite(n)) return 0;
+  if(negative && !creditMark) return -Math.abs(n);
+  return Math.abs(n) * (negative ? -1 : 1);
 }
 
 const B58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
@@ -1000,6 +1027,140 @@ let currentFilterAccount = null;
 let selectedTxIds = new Set();
 let graphMode = 'all'; // 'all' | 'in' | 'out' | 'manual'
 
+function cleanCell(value){
+  if(value === null || value === undefined) return '';
+  return String(value).replace(/\u00a0/g,' ').replace(/[\t\r\n]+/g,' ').replace(/\s{2,}/g,' ').trim();
+}
+function foldText(value){
+  return cleanCell(value).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
+}
+function headerKey(value){ return foldText(value).replace(/[^a-z0-9]+/g,''); }
+
+const HEADER_ALIASES = {
+  fecha:['fecha','fecha operacion','f operacion','fecha movimiento','fecha contable','fecha contabilizacion','date','booking date','transaction date'],
+  fechaValor:['fecha valor','f valor','value date','valuta'],
+  cuenta:['iban','cuenta','n cuenta','numero cuenta','nº cuenta','account','account number','cta'],
+  contraparte:['contraparte','beneficiario','ordenante','titular','tercero','nombre beneficiario','nombre ordenante','destinatario','remitente','counterparty','beneficiary','payer','payee'],
+  concepto:['concepto','descripcion','descripción','detalle','observaciones','texto','movimiento','concept','description','memo','narrative','descripcion ampliada'],
+  importe:['importe','cantidad','amount','monto','valor','importe eur','importe movimiento','importe operacion','importe operación'],
+  debe:['debe','cargo','cargos','debito','débito','debit','withdrawal','importe debe','importe cargo'],
+  haber:['haber','abono','abonos','credito','crédito','credit','deposit','importe haber','importe abono'],
+  saldo:['saldo','balance','saldo disponible','saldo contable'],
+  referencia:['referencia','ref','referencia operacion','n referencia','numero referencia','id operacion','transaction id','id movimiento'],
+  tipo:['tipo','tipo movimiento','clase','signo','naturaleza','cargo abono','debe haber','d h','operation type','transaction type'],
+  divisa:['divisa','moneda','currency']
+};
+function guessField(header){
+  const h = foldText(header), k = headerKey(header);
+  let best = 'ignorar', bestScore = 0;
+  for(const [target, aliases] of Object.entries(HEADER_ALIASES)){
+    for(const alias of aliases){
+      const a = foldText(alias), ak = headerKey(alias);
+      let score = 0;
+      if(k === ak) score = 100;
+      else if(k && ak && (k.includes(ak) || ak.includes(k))) score = Math.min(k.length,ak.length) >= 4 ? 70 : 0;
+      else if(h.includes(a)) score = 55;
+      if(score > bestScore){ bestScore=score; best=target; }
+    }
+  }
+  return best;
+}
+function headerRowScore(row){
+  if(!Array.isArray(row)) return -1;
+  const guesses = row.map(guessField).filter(x=>x!=='ignorar');
+  const unique = new Set(guesses);
+  let score = unique.size * 5 + guesses.length;
+  if(unique.has('fecha')) score += 6;
+  if(unique.has('importe') || unique.has('debe') || unique.has('haber')) score += 8;
+  if(unique.has('concepto') || unique.has('contraparte')) score += 3;
+  return score;
+}
+function dedupeHeaders(row){
+  const seen = {};
+  return row.map((v,i)=>{
+    let h = cleanCell(v) || `Columna ${i+1}`;
+    seen[h] = (seen[h]||0)+1;
+    return seen[h] > 1 ? `${h} (${seen[h]})` : h;
+  });
+}
+function matrixToRows(matrix, headerIndex){
+  const headers = dedupeHeaders(matrix[headerIndex] || []);
+  const rows = [];
+  for(const arr of matrix.slice(headerIndex+1)){
+    if(!arr || !arr.some(v=>cleanCell(v)!=='')) continue;
+    const obj = {};
+    headers.forEach((h,i)=>{ obj[h] = arr[i] ?? ''; });
+    rows.push(obj);
+  }
+  return {headers, rows};
+}
+function detectMatrixHeader(matrix, maxScan=30){
+  let bestIndex=0, bestScore=-1;
+  for(let i=0;i<Math.min(matrix.length,maxScan);i++){
+    const score = headerRowScore(matrix[i]);
+    if(score>bestScore){ bestScore=score; bestIndex=i; }
+  }
+  return {index:bestIndex, score:bestScore};
+}
+function parseDelimitedBankText(text){
+  const cleaned = text.replace(/^\uFEFF/,'');
+  const candidates = [',',';','\t','|'];
+  let best = null;
+  for(const delimiter of candidates){
+    const parsed = Papa.parse(cleaned,{header:false,skipEmptyLines:'greedy',dynamicTyping:false,delimiter});
+    const matrix = parsed.data || [];
+    if(!matrix.length) continue;
+    const detected = detectMatrixHeader(matrix,35);
+    const width = Math.max(...matrix.slice(detected.index,detected.index+6).map(r=>Array.isArray(r)?r.length:0),0);
+    const consistency = matrix.slice(detected.index,detected.index+12).filter(r=>Array.isArray(r)&&r.length===width).length;
+    const score = detected.score*10 + Math.min(width,20) + consistency;
+    if(width>=2 && (!best || score>best.score)) best={matrix,headerIndex:detected.index,score,delimiter};
+  }
+  if(!best){
+    const parsed=Papa.parse(cleaned,{header:false,skipEmptyLines:'greedy',dynamicTyping:false});
+    const detected=detectMatrixHeader(parsed.data||[],35);
+    best={matrix:parsed.data||[],headerIndex:detected.index,score:detected.score,delimiter:parsed.meta?.delimiter||''};
+  }
+  return {...matrixToRows(best.matrix,best.headerIndex), headerIndex:best.headerIndex, delimiter:best.delimiter};
+}
+function excelSerialToDate(v){
+  if(typeof v !== 'number' || !Number.isFinite(v) || v < 1 || v > 100000) return null;
+  const d = XLSX.SSF.parse_date_code(v);
+  if(!d || !d.y || !d.m || !d.d) return null;
+  return `${String(d.d).padStart(2,'0')}/${String(d.m).padStart(2,'0')}/${d.y}`;
+}
+function normalizeDateValue(value){
+  if(value instanceof Date && !isNaN(value)) return `${String(value.getDate()).padStart(2,'0')}/${String(value.getMonth()+1).padStart(2,'0')}/${value.getFullYear()}`;
+  const excel = excelSerialToDate(value); if(excel) return excel;
+  let s=cleanCell(value); if(!s) return '';
+  let m=s.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:[ T].*)?$/);
+  if(m) return `${m[3].padStart(2,'0')}/${m[2].padStart(2,'0')}/${m[1]}`;
+  m=s.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})(?:[ T].*)?$/);
+  if(m){ let y=m[3]; if(y.length===2) y=(Number(y)>=70?'19':'20')+y; return `${m[1].padStart(2,'0')}/${m[2].padStart(2,'0')}/${y}`; }
+  return s;
+}
+function extractAccountLike(text){
+  const s=cleanCell(text).toUpperCase();
+  if(!s) return '';
+  const compact=s.replace(/[\s-]+/g,'');
+  const iban=compact.match(/[A-Z]{2}\d{2}[A-Z0-9]{11,30}/);
+  if(iban) return iban[0];
+  const ccc=compact.match(/(?:^|\D)(\d{20})(?:\D|$)/); if(ccc) return ccc[1];
+  return '';
+}
+function classifyDirection(value){
+  const s=foldText(value);
+  if(!s) return 0;
+  if(/cargo|debe|debito|debit|salida|pago|emitid|enviad|withdraw|outgoing|^d$|^dr$/.test(s)) return -1;
+  if(/abono|haber|credito|credit|entrada|ingreso|recibid|deposit|incoming|^h$|^cr$/.test(s)) return 1;
+  return 0;
+}
+function joinValues(row, cols, sep=' · '){
+  const vals=[];
+  (cols||[]).forEach(c=>{ const v=cleanCell(row[c]); if(v && !vals.includes(v)) vals.push(v); });
+  return vals.join(sep);
+}
+
 function handleBankFile(evt){
   const file = evt.target.files[0];
   if(!file) return;
@@ -1009,14 +1170,25 @@ function handleBankFile(evt){
   if(ext === 'xlsx' || ext === 'xls'){
     const reader = new FileReader();
     reader.onload = e=>{
-      const wb = XLSX.read(new Uint8Array(e.target.result), {type:'array'});
-      const sheet = wb.Sheets[wb.SheetNames[0]];
-      const json = XLSX.utils.sheet_to_json(sheet, {defval:''});
-      rawParsedRows = json;
-      rawHeaders = json.length ? Object.keys(json[0]) : [];
-      sourceFormat = 'XLSX';
-      statusEl.innerHTML = `<span class="badge ok">leído</span> ${json.length} filas, hoja "${wb.SheetNames[0]}"`;
-      showMappingPanel();
+      try{
+        const wb = XLSX.read(new Uint8Array(e.target.result), {type:'array',cellDates:true});
+        let best=null;
+        wb.SheetNames.forEach(name=>{
+          const matrix=XLSX.utils.sheet_to_json(wb.Sheets[name],{header:1,defval:'',raw:true,blankrows:false});
+          if(!matrix.length) return;
+          const detected=detectMatrixHeader(matrix,35);
+          const converted=matrixToRows(matrix,detected.index);
+          const meaningful=converted.rows.filter(r=>Object.values(r).some(v=>cleanCell(v)!=='')).length;
+          const score=detected.score*100 + Math.min(meaningful,999);
+          if(!best || score>best.score) best={name,matrix,detected,converted,score};
+        });
+        if(!best) throw new Error('No se encontraron filas utilizables en el libro.');
+        rawParsedRows=best.converted.rows;
+        rawHeaders=best.converted.headers;
+        sourceFormat='XLSX';
+        statusEl.innerHTML=`<span class="badge ok">leído</span> ${rawParsedRows.length} filas · hoja "${escapeHtml(best.name)}" · cabecera detectada en fila ${best.detected.index+1}`;
+        showMappingPanel();
+      }catch(err){ statusEl.innerHTML=`<span class="badge bad">error</span> ${escapeHtml(err.message||'No se pudo leer el Excel')}`; }
     };
     reader.readAsArrayBuffer(file);
     return;
@@ -1025,46 +1197,30 @@ function handleBankFile(evt){
   const reader = new FileReader();
   reader.onload = e=>{
     const text = e.target.result;
-    // detección Norma43: líneas de 80 chars empezando por 11/22/23/24/33/88
-    const firstLines = text.split(/\r?\n/).slice(0,5).filter(l=>l.length>0);
-    const looksN43 = firstLines.length && firstLines.every(l => /^(11|22|23|24|33|88)/.test(l));
+    const firstLines = text.split(/\r?\n/).slice(0,8).map(l=>l.trim()).filter(Boolean);
+    const n43Hits=firstLines.filter(l=>/^(11|22|23|24|33|88)/.test(l)).length;
+    const looksN43 = firstLines.length>=2 && n43Hits/firstLines.length>=0.75;
     if(looksN43){
       const txs = parseNorma43(text);
-      sourceFormat = 'Norma43';
-      normalizedTx = txs;
-      statusEl.innerHTML = `<span class="badge ok">Norma 43 detectada</span> ${txs.length} movimientos extraídos. Ver aviso en Inicio: anchos de campo por mejor esfuerzo, revisa antes de usar como prueba.`;
-      document.getElementById('mappingPanel').style.display='none';
-      finishNormalization();
-      return;
+      sourceFormat = 'Norma43'; normalizedTx = txs;
+      statusEl.innerHTML = `<span class="badge ok">Norma 43 detectada</span> ${txs.length} movimientos extraídos.`;
+      document.getElementById('mappingPanel').style.display='none'; finishNormalization(); return;
     }
-    // si no, tratar como CSV / TSV / texto delimitado
-    const parsed = Papa.parse(text, {header:true, skipEmptyLines:true, dynamicTyping:false});
-    rawParsedRows = parsed.data;
-    rawHeaders = parsed.meta.fields || (rawParsedRows.length ? Object.keys(rawParsedRows[0]) : []);
-    sourceFormat = ext === 'txt' ? 'TXT (delimitado)' : 'CSV';
-    statusEl.innerHTML = `<span class="badge ok">leído</span> ${rawParsedRows.length} filas como ${sourceFormat}`;
-    showMappingPanel();
+    try{
+      const parsed=parseDelimitedBankText(text);
+      rawParsedRows=parsed.rows; rawHeaders=parsed.headers;
+      sourceFormat=ext==='txt'?'TXT':'CSV';
+      const delimName=parsed.delimiter==='\t'?'TAB':(parsed.delimiter||'auto');
+      statusEl.innerHTML=`<span class="badge ok">leído</span> ${rawParsedRows.length} filas · ${sourceFormat} · separador ${escapeHtml(delimName)} · cabecera fila ${parsed.headerIndex+1}`;
+      showMappingPanel();
+    }catch(err){ statusEl.innerHTML=`<span class="badge bad">error</span> ${escapeHtml(err.message||'No se pudo interpretar el fichero')}`; }
   };
   reader.readAsText(file);
 }
 
-const FIELD_TARGETS = ['fecha','cuenta','contraparte','concepto','importe','debe','haber','saldo','referencia','ignorar'];
-function guessField(header){
-  const h = header.toLowerCase();
-  if(/fecha|date/.test(h)) return 'fecha';
-  if(/iban|cuenta|account/.test(h)) return 'cuenta';
-  if(/beneficiari|ordenante|contrapart|titular|tercero|nombre|counterpart/.test(h)) return 'contraparte';
-  if(/concepto|descrip|detalle|concept/.test(h)) return 'concepto';
-  if(/^debe$|cargo|débito|debit/.test(h)) return 'debe';
-  if(/^haber$|abono|crédito|credit/.test(h)) return 'haber';
-  if(/importe|cantidad|amount|monto/.test(h)) return 'importe';
-  if(/saldo|balance/.test(h)) return 'saldo';
-  if(/referenc|ref\.?$/.test(h)) return 'referencia';
-  return 'ignorar';
-}
+const FIELD_TARGETS = ['fecha','fechaValor','cuenta','contraparte','concepto','importe','debe','haber','saldo','referencia','tipo','divisa','ignorar'];
 function showMappingPanel(){
-  const panel = document.getElementById('mappingPanel');
-  panel.style.display = 'block';
+  const panel = document.getElementById('mappingPanel'); panel.style.display = 'block';
   const rows = document.getElementById('mappingRows');
   rows.innerHTML = rawHeaders.map(h=>{
     const guess = guessField(h);
@@ -1075,43 +1231,52 @@ function showMappingPanel(){
 
 function normalizeTransactions(){
   const selects = document.querySelectorAll('#mappingRows select');
-  const map = {};
-  selects.forEach(s=>{ map[s.dataset.header] = s.value; });
+  const map = {}; selects.forEach(s=>{ map[s.dataset.header] = s.value; });
+  const findCols = target => Object.keys(map).filter(h=>map[h]===target);
+  const fechaCols=findCols('fecha'), fechaValorCols=findCols('fechaValor'), cuentaCols=findCols('cuenta'), contraCols=findCols('contraparte'),
+        conceptoCols=findCols('concepto'), importeCols=findCols('importe'), debeCols=findCols('debe'), haberCols=findCols('haber'),
+        saldoCols=findCols('saldo'), refCols=findCols('referencia'), tipoCols=findCols('tipo'), divisaCols=findCols('divisa');
 
-  const findCol = target => Object.keys(map).find(h=>map[h]===target);
-  const fechaCol = findCol('fecha'), cuentaCol = findCol('cuenta'), contraCol = findCol('contraparte'),
-        conceptoCol = findCol('concepto'), importeCol = findCol('importe'), debeCol = findCol('debe'),
-        haberCol = findCol('haber'), saldoCol = findCol('saldo'), refCol = findCol('referencia');
-
-  const ibanRegex = /[A-Z]{2}\d{2}[A-Z0-9]{10,30}/;
+  let dropped=0, inferredSign=0, extractedAccount=0;
   normalizedTx = rawParsedRows.map(r=>{
-    let importe = 0;
-    if(importeCol){ importe = parseMoney(r[importeCol]); }
-    else if(debeCol || haberCol){
-      const d = parseMoney(r[debeCol]);
-      const h = parseMoney(r[haberCol]);
-      importe = h - Math.abs(d);
+    const concepto=joinValues(r,conceptoCols,' | ');
+    const tipo=joinValues(r,tipoCols,' ');
+    let importe=0;
+    const debitValues=debeCols.map(c=>parseMoney(r[c])).filter(v=>v!==0);
+    const creditValues=haberCols.map(c=>parseMoney(r[c])).filter(v=>v!==0);
+    if(debitValues.length || creditValues.length){
+      importe=creditValues.reduce((a,v)=>a+Math.abs(v),0)-debitValues.reduce((a,v)=>a+Math.abs(v),0);
+    } else if(importeCols.length){
+      for(const c of importeCols){ const v=parseMoney(r[c]); if(v!==0){ importe=v; break; } }
+      const dir=classifyDirection(tipo);
+      if(dir && importe!==0 && Math.sign(importe)!==dir){ importe=Math.abs(importe)*dir; inferredSign++; }
     }
-    let contraparte = contraCol ? (r[contraCol]||'').toString().trim() : '';
-    const concepto = conceptoCol ? (r[conceptoCol]||'').toString().trim() : '';
-    if(!contraparte){
-      const m = concepto.match(ibanRegex);
-      if(m) contraparte = m[0];
-    }
+
+    let cuenta=joinValues(r,cuentaCols,' ');
+    const extractedOwn=extractAccountLike(cuenta); if(extractedOwn) cuenta=extractedOwn;
+    let contraparte=joinValues(r,contraCols,' | ');
+    let cpAccount=extractAccountLike(contraparte) || extractAccountLike(concepto);
+    if(cpAccount && (!contraparte || !extractAccountLike(contraparte))){ contraparte=cpAccount; extractedAccount++; }
+    else if(cpAccount && contraparte && !contraparte.includes(cpAccount)) contraparte=`${contraparte} · ${cpAccount}`;
+
+    const fechaRaw=fechaCols.length ? r[fechaCols.find(c=>cleanCell(r[c])) || fechaCols[0]] : '';
+    const fvRaw=fechaValorCols.length ? r[fechaValorCols.find(c=>cleanCell(r[c])) || fechaValorCols[0]] : '';
+    const saldoVal=saldoCols.length ? r[saldoCols.find(c=>cleanCell(r[c])) || saldoCols[0]] : '';
+    const ref=joinValues(r,refCols,' | ');
+    const divisa=joinValues(r,divisaCols,' ');
+    const emptyMeaningful=!normalizeDateValue(fechaRaw) && !concepto && !contraparte && importe===0 && !ref;
+    if(emptyMeaningful){ dropped++; return null; }
     return {
-      fecha: fechaCol ? (r[fechaCol]||'').toString().trim() : '',
-      cuenta: cuentaCol ? (r[cuentaCol]||'').toString().trim() : '(sin identificar)',
-      contraparte: contraparte || '(sin identificar)',
-      concepto,
-      importe,
-      saldo: saldoCol ? (r[saldoCol]||'').toString().trim() : '',
-      referencia: refCol ? (r[refCol]||'').toString().trim() : '',
+      fecha: normalizeDateValue(fechaRaw), fechaValor: normalizeDateValue(fvRaw),
+      cuenta: cleanCell(cuenta) || '(sin identificar)', contraparte: cleanCell(contraparte) || '(sin identificar)',
+      concepto, importe, saldo: saldoVal===''?'':parseMoney(saldoVal), referencia:ref, tipo, divisa,
       origen: sourceFormat
     };
-  });
+  }).filter(Boolean);
+  const statusEl=document.getElementById('bankFileStatus');
+  if(statusEl) statusEl.innerHTML += ` <span class="badge ok">normalizado</span> ${normalizedTx.length} movimientos${inferredSign?` · ${inferredSign} signos inferidos`:''}${extractedAccount?` · ${extractedAccount} cuentas extraídas`:''}${dropped?` · ${dropped} filas vacías descartadas`:''}`;
   finishNormalization();
 }
-
 function finishNormalization(){
   document.getElementById('statsPanel').style.display='block';
   document.getElementById('summaryPanel').style.display='block';
