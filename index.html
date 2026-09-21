@@ -284,7 +284,7 @@ h1{font-size:21px;padding-bottom:8px;border-bottom:1px solid var(--line);color:v
     <!-- GRAFO -->
     <div class="view" id="v-grafo">
       <h1>Normalizador + Grafo de movimientos</h1>
-      <p class="lede">Sube extractos bancarios en CSV, XLSX, TXT o Norma 43 (AEB). El módulo detecta el formato, normaliza los movimientos, redacta un resumen del análisis en lenguaje natural, señala patrones que pueden merecer revisión y construye un grafo dirigido de la trazabilidad del dinero.</p>
+      <p class="lede">Sube extractos bancarios en CSV, XLSX, TXT, OFX, QIF o Norma 43 (AEB). El módulo localiza cabeceras y columnas, determina cargos y abonos por varias señales, marca los casos dudosos y construye el resumen y el grafo dirigido de la trazabilidad del dinero.</p>
 
       <div class="panel">
         <div class="field" style="max-width:520px;">
@@ -292,16 +292,16 @@ h1{font-size:21px;padding-bottom:8px;border-bottom:1px solid var(--line);color:v
           <input type="text" id="investigatedAccountInput" placeholder="ES00 0000 0000 0000 0000 0000" oninput="buildTxGraph()">
           <div class="note" style="border:0;padding:0;">Introduce la cuenta a la que pertenece el extracto. Será el único nodo central: los abonos entrarán en ella y los cargos saldrán de ella. Si el archivo identifica de forma inequívoca una única cuenta, se completará automáticamente.</div>
         </div>
-        <div class="filedrop" onclick="document.getElementById('bankFile').click()">
-          Arrastra o selecciona un archivo (.csv, .txt, .xlsx, .xls)
-          <input type="file" id="bankFile" accept=".csv,.txt,.xlsx,.xls" onchange="handleBankFile(event)">
+        <div class="filedrop" id="bankDropZone" onclick="document.getElementById('bankFile').click()">
+          Arrastra o selecciona un archivo (.csv, .txt, .xlsx, .xls, .ofx, .qif)
+          <input type="file" id="bankFile" accept=".csv,.txt,.xlsx,.xls,.ofx,.qif" onchange="handleBankFile(event)">
         </div>
         <div id="bankFileStatus" class="note" style="border:none;padding:0;"></div>
       </div>
 
       <div class="panel" id="mappingPanel" style="display:none;">
         <h2>Mapeo de columnas</h2>
-        <p class="note" style="border:none;padding:0;margin-bottom:10px;">Detección automática. Corrige si algo no encaja y pulsa Normalizar.</p>
+        <p class="note" style="border:none;padding:0;margin-bottom:10px;">Detección automática. Revisa especialmente importe, debe, haber, saldo y sentido. Puedes asignar varias columnas a concepto o referencia; se combinarán al normalizar.</p>
         <div id="mappingRows"></div>
         <div style="margin-top:14px;"><button class="btn" onclick="normalizeTransactions()">Normalizar movimientos</button></div>
       </div>
@@ -371,7 +371,7 @@ h1{font-size:21px;padding-bottom:8px;border-bottom:1px solid var(--line);color:v
           </div>
         </div>
         <div class="tablewrap">
-          <table id="txTable"><thead><tr><th style="width:26px;"><input type="checkbox" id="txSelectAllHead" onchange="selectAllVisible(this.checked)"></th><th>Fecha</th><th>Cuenta</th><th>Contraparte</th><th>Concepto</th><th>Importe</th><th>Saldo</th><th>Origen</th></tr></thead><tbody></tbody></table>
+          <table id="txTable"><thead><tr><th style="width:26px;"><input type="checkbox" id="txSelectAllHead" onchange="selectAllVisible(this.checked)"></th><th>Fecha</th><th>Cuenta</th><th>Contraparte</th><th>Concepto</th><th>Importe</th><th>Saldo</th><th>Detección</th><th>Origen</th></tr></thead><tbody></tbody></table>
         </div>
       </div>
     </div>
@@ -407,51 +407,32 @@ async function sha256d(bytes){ return sha256(await sha256(bytes)); }
 function parseMoney(value){
   if(typeof value === 'number') return Number.isFinite(value) ? value : 0;
   if(value === null || value === undefined) return 0;
-  let original = String(value).trim();
-  if(!original) return 0;
-
-  // Convenciones habituales en extractos: -123,45 / 123,45- / (123,45) / 123,45 D o DB.
-  const debitMark = /(?:^|\s)(D|DB|DR|DEBE|CARGO|DEBITO|DÉBITO)(?:\s|$)/i.test(original);
-  const creditMark = /(?:^|\s)(H|HB|CR|CREDITO|CRÉDITO|ABONO|HABER)(?:\s|$)/i.test(original);
-  const negative = /^\s*-/.test(original) || /-\s*(?:[A-Z]{0,3})?\s*$/i.test(original) || /^\s*\(.*\)\s*$/.test(original) || debitMark;
-  let s = original
-    .replace(/\u00a0/g,' ')
-    .replace(/[()]/g,'')
-    .replace(/(?:^|\s)(?:EUR|EUROS?|€|USD|GBP|CHF)(?:\s|$)/gi,' ')
-    .replace(/(?:^|\s)(?:D|DB|DR|DEBE|CARGO|DEBITO|DÉBITO|H|HB|CR|CREDITO|CRÉDITO|ABONO|HABER)(?:\s|$)/gi,' ')
-    .replace(/[^0-9,.'+\-]/g,'')
-    .replace(/'/g,'')
-    .replace(/[+\-]/g,'');
+  let s = String(value).trim();
   if(!s) return 0;
-
+  const negative = /^\s*\(.*\)\s*$/.test(s) || /^\s*-/.test(s) || /-\s*$/.test(s) || /\b(D|DR|DB|DEBIT|DEBE|CARGO|ADEUDO)\b/i.test(s);
+  s = s.replace(/[()]/g,'').replace(/[^0-9,.'-]/g,'').replace(/'/g,'').replace(/-/g,'');
   const comma = s.lastIndexOf(','), dot = s.lastIndexOf('.');
   if(comma >= 0 && dot >= 0){
     const decimal = comma > dot ? ',' : '.';
     const thousands = decimal === ',' ? /\./g : /,/g;
     s = s.replace(thousands,'').replace(decimal,'.');
   } else if(comma >= 0){
-    const parts = s.split(',');
-    if(parts.length > 2){
-      const last = parts.pop();
-      s = last.length <= 2 ? parts.join('')+'.'+last : parts.join('')+last;
-    } else {
-      const decimals = s.length - comma - 1;
-      s = (decimals === 3 && /^\d{1,3}(,\d{3})+$/.test(s)) ? s.replace(/,/g,'') : s.replace(',','.');
-    }
+    const decimals = s.length - comma - 1;
+    s = decimals === 3 && /^\d{1,3}(,\d{3})+$/.test(s) ? s.replace(/,/g,'') : s.replace(/,/g,'.');
   } else if(dot >= 0){
-    const parts = s.split('.');
-    if(parts.length > 2){
-      const last = parts.pop();
-      s = last.length <= 2 ? parts.join('')+'.'+last : parts.join('')+last;
-    } else {
-      const decimals = s.length - dot - 1;
-      if(decimals === 3 && /^\d{1,3}(\.\d{3})+$/.test(s)) s = s.replace(/\./g,'');
-    }
+    const decimals = s.length - dot - 1;
+    if(decimals === 3 && /^\d{1,3}(\.\d{3})+$/.test(s)) s = s.replace(/\./g,'');
   }
   const n = Number(s);
-  if(!Number.isFinite(n)) return 0;
-  if(negative && !creditMark) return -Math.abs(n);
-  return Math.abs(n) * (negative ? -1 : 1);
+  return Number.isFinite(n) ? (negative ? -Math.abs(n) : n) : 0;
+}
+
+function normalizeText(value){
+  return String(value == null ? '' : value).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().trim();
+}
+function googleSearchUrl(query){ return `https://www.google.com/search?q=${encodeURIComponent(query)}`; }
+function dorkButtons(queries){
+  return `<div class="row" style="margin-top:10px;">${queries.map(([label,q])=>`<a class="btn ghost small" href="${googleSearchUrl(q)}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)}</a>`).join('')}</div>`;
 }
 
 const B58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
@@ -610,7 +591,12 @@ async function checkCrypto(){
     const links = btc
       ? [['mempool.space',`https://mempool.space/address/${encodeURIComponent(input)}`],['Blockchair',`https://blockchair.com/bitcoin/address/${encodeURIComponent(input)}`],['Blockchain.com',`https://www.blockchain.com/explorer/addresses/btc/${encodeURIComponent(input)}`]]
       : [['Etherscan',`https://etherscan.io/address/${encodeURIComponent(input)}`],['Blockchair',`https://blockchair.com/ethereum/address/${encodeURIComponent(input)}`]];
-    html += `<div class="hr"></div><div class="row">${links.map(([n,u])=>`<a class="btn ghost small" href="${u}" target="_blank" rel="noopener noreferrer">Abrir en ${n}</a>`).join('')}</div><div class="note">Los enlaces abren consultas externas solo al pulsarlos. La validación anterior es local.</div>`;
+    html += `<div class="hr"></div><div class="row">${links.map(([n,u])=>`<a class="btn ghost small" href="${u}" target="_blank" rel="noopener noreferrer">Abrir en ${n}</a>`).join('')}</div>
+      <h2 style="margin-top:16px;">Pivotes OSINT</h2>${dorkButtons([
+        ['Google · dirección exacta',`"${input}"`],
+        ['Google · informes y documentos',`"${input}" (scam OR fraud OR estafa OR fraude OR filetype:pdf)`],
+        ['Google · código y repositorios',`"${input}" (site:github.com OR site:gitlab.com OR site:pastebin.com)`]
+      ])}<div class="note">Los exploradores y dorks externos solo reciben la dirección al pulsar. La validación anterior se realiza localmente.</div>`;
   }
   box.innerHTML = html;
 }
@@ -658,15 +644,16 @@ function buildCryptoGraph(){
     document.getElementById('cryptoGraphStats').innerHTML = `<div class="note" style="border-color:var(--red);">Sin filas reconocibles.</div>`;
     return;
   }
-  const keys = Object.keys(rows[0]).map(k=>k.toLowerCase());
-  const pick = (...cands) => {
-    for(const c of cands){ const k = Object.keys(rows[0]).find(kk=>kk.toLowerCase().includes(c)); if(k) return k; }
-    return null;
+  const pick = (...aliases) => {
+    const entries=Object.keys(rows[0]).map(k=>[k,normalizeText(k).replace(/[^a-z0-9]/g,'')]);
+    const normalized=aliases.map(a=>normalizeText(a).replace(/[^a-z0-9]/g,''));
+    return entries.find(([,n])=>normalized.includes(n))?.[0] || entries.find(([,n])=>normalized.some(a=>a.length>=4&&(n.startsWith(a)||n.endsWith(a))))?.[0] || null;
   };
-  const fromK = pick('from','origen','sender','ordenante');
-  const toK = pick('to','destino','receiver','beneficiario');
-  const valK = pick('value','amount','importe','cantidad','valuein','quantity');
-  const hashK = pick('hash','txid','tx hash','transaction');
+  const fromK = pick('from','from address','fromaddress','origen','sender','sender address','ordenante','source');
+  const toK = pick('to','to address','toaddress','destino','receiver','receiver address','beneficiario','destination');
+  const valK = pick('value','value in','amount','importe','cantidad','quantity','crypto amount');
+  const hashK = pick('hash','txid','tx hash','transaction hash','transactionhash');
+  const timeK = pick('timestamp','time stamp','datetime','date time','fecha','block time','time');
 
   if(!fromK || !toK){
     document.getElementById('cryptoGraphStats').innerHTML = `<div class="note" style="border-color:var(--red);">No se detectaron columnas from/to. Columnas encontradas: ${Object.keys(rows[0]).join(', ')}</div>`;
@@ -681,7 +668,7 @@ function buildCryptoGraph(){
     if(!from || !to) return;
     let val = valK ? Math.abs(parseMoney(r[valK])) : 1;
     totalValue += val;
-    links.push({source: from, target: to, value: val, hash: hashK ? r[hashK] : ''});
+    links.push({source: from, target: to, value: val, count:1, hash: hashK ? r[hashK] : '', timestamp:timeK?r[timeK]:'', credit:true});
   });
 
   const nodesMap = new Map();
@@ -702,7 +689,30 @@ function buildCryptoGraph(){
     <div class="stat"><div class="n">${links.length}</div><div class="l">transacciones</div></div>
     <div class="stat"><div class="n">${nodes.filter(n=>n.known).length}</div><div class="l">identificadas</div></div>
   `;
-  renderForceGraph('cryptoGraphWrap', nodes, links, {colorBy: n=>n.known?'#c9922f':'#4a8f8c', linkColor: ()=>'#4a8f8c', directed:true});
+  renderForceGraph('cryptoGraphWrap', nodes, links, {
+    colorBy:n=>n.known?'#c9922f':'#4a8f8c',linkColor:()=>'#4a8f8c',directed:true,linkLabels:true,linkUnit:'',
+    onLinkClick:l=>openCryptoMovementDetail(l),
+    onNodeClick:(nodeId,n)=>{
+      const address=n.fullLabel||nodeId;
+      document.getElementById('cryptoInput').value=address;
+      checkCrypto();
+    }
+  });
+}
+
+function openCryptoMovementDetail(link){
+  const modal=document.getElementById('movementModal'),body=document.getElementById('movementModalBody');
+  if(!modal||!body)return;
+  const source=typeof link.source==='object'?link.source.id:link.source;
+  const target=typeof link.target==='object'?link.target.id:link.target;
+  body.innerHTML=`<div class="movement-amount">${fmtEUR(Number(link.value)||0)}</div><div class="kv">
+    <div class="k">Origen</div><div class="v">${escapeHtml(source||'—')}</div>
+    <div class="k">Destino</div><div class="v">${escapeHtml(target||'—')}</div>
+    <div class="k">Fecha / hora</div><div class="v">${escapeHtml(link.timestamp||'—')}</div>
+    <div class="k">Hash / TXID</div><div class="v" style="overflow-wrap:anywhere;">${escapeHtml(link.hash||'—')}</div>
+  </div>${dorkButtons([['Google · hash o TXID',`"${link.hash||''}"`],['Google · dirección origen',`"${source||''}"`],['Google · dirección destino',`"${target||''}"`]])}`;
+  modal.classList.add('open');
+  modal.querySelector('.movement-dialog-close')?.focus();
 }
 
 /* ======================= IBAN / CCC ======================= */
@@ -853,6 +863,14 @@ function checkIban(){
   else {
     html = `<div class="badge bad">Formato no reconocido</div><div class="note">Se esperaba un IBAN (2 letras país + 2 dígitos + BBAN) o un CCC español de 20 dígitos.</div>`;
   }
+  if(/^\d{20}$/.test(raw) || /^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/.test(raw)){
+    const spaced = raw.replace(/(.{4})/g,'$1 ').trim();
+    html += `<div class="hr"></div><h2>Pivotes OSINT</h2>${dorkButtons([
+      ['Google · coincidencia exacta',`"${raw}"`],
+      ['Google · formato espaciado',`"${spaced}"`],
+      ['Google · documentos',`"${raw}" (filetype:pdf OR filetype:xls OR filetype:xlsx OR filetype:csv)`]
+    ])}<div class="note">La búsqueda solo se envía a Google cuando pulsas un botón. Contrasta cualquier coincidencia con fuentes oficiales.</div>`;
+  }
   box.innerHTML = html;
 }
 function ibanCheckDigitsFromBban(country, bban){
@@ -972,15 +990,24 @@ function checkCard(){
   } else {
     html += `<div class="note">No has cargado una tabla BIN local: la red y el sector pueden inferirse, pero el emisor exige datos de rangos actualizados. La importación admite BIN/IIN de 6 u 8 dígitos y columnas de intervalo inicial/final.</div>`;
   }
+  const iin = digitsOnly.slice(0,Math.min(8,digitsOnly.length));
+  html += `<div class="hr"></div><h2>Pivotes OSINT del BIN/IIN</h2>${dorkButtons([
+    ['Google · BIN exacto',`"${iin}" (BIN OR IIN OR issuer OR emisor)`],
+    ['Google · documentación',`"${iin}" (filetype:pdf OR filetype:csv OR filetype:xlsx)`]
+  ])}<div class="note">Por seguridad, los dorks utilizan únicamente los primeros 6–8 dígitos; nunca envían el número completo de tarjeta.</div>`;
   box.innerHTML = html;
 }
 
 /* ======================= NORMA 43 (AEB) — mejor esfuerzo ======================= */
 function parseNorma43(text){
-  const lines = text.split(/\r?\n/).filter(l=>l.length>0);
+  const lines = text.split(/\r?\n/).map(l=>l.replace(/\r$/,'')).filter(l=>l.length>=2);
   const txs = [];
   let currentAccount = null;
-  const fmtDate = s => { if(!/^\d{6}$/.test(s)) return ''; return `20${s.slice(0,2)}-${s.slice(2,4)}-${s.slice(4,6)}`; };
+  const fmtDate = s => {
+    if(!/^\d{6}$/.test(s)) return '';
+    const yy=Number(s.slice(0,2)), year=yy>=70?1900+yy:2000+yy;
+    return `${year}-${s.slice(2,4)}-${s.slice(4,6)}`;
+  };
   lines.forEach(line=>{
     const type = line.slice(0,2);
     if(type === '11'){
@@ -989,28 +1016,31 @@ function parseNorma43(text){
         fechaInicio: fmtDate(line.slice(20,26)), fechaFin: fmtDate(line.slice(26,32))
       };
     } else if(type === '22'){
-      const claveChar = line.slice(28,29);
-      const esDebe = ['1','2','3','4'].includes(claveChar) && !['5','6'].includes(claveChar); // aproximado
-      const importeRaw = line.slice(29,44).replace(/\D/g,'');
+      // Norma 43: fecha op. 21-26, fecha valor 27-32, conceptos 33-37,
+      // clave debe/haber 38, importe 39-52, documento 53-62 y referencias 63-80.
+      const claveChar = line.slice(37,38).trim();
+      const importeRaw = line.slice(38,52).replace(/\D/g,'');
       let importe = importeRaw ? parseInt(importeRaw,10)/100 : 0;
-      // heurística de signo: claves impares/1x = adeudo, pares/2x = abono (varía por banco, revisar)
-      const debito = /^(1|01|21|24)/.test(claveChar);
+      const debito = claveChar === '1';
       importe = debito ? -Math.abs(importe) : Math.abs(importe);
       txs.push({
-        fecha: fmtDate(line.slice(12,18)),
-        fechaValor: fmtDate(line.slice(18,24)),
-        cuenta: currentAccount ? `${currentAccount.entidad}-${currentAccount.oficina}-${currentAccount.cuenta}` : (line.slice(2,10)),
-        concepto: `com:${line.slice(24,26)} prop:${line.slice(26,28)}`,
+        fecha: fmtDate(line.slice(20,26)),
+        fechaValor: fmtDate(line.slice(26,32)),
+        cuenta: currentAccount ? `${currentAccount.entidad}${currentAccount.oficina}${currentAccount.cuenta}` : line.slice(2,20).trim(),
+        concepto: `com:${line.slice(32,34).trim()} propio:${line.slice(34,37).trim()}`,
         contraparte: '',
         importe: importe,
         saldo: '',
-        referencia: line.slice(44,60).trim(),
-        origen: 'Norma43'
+        referencia: `${line.slice(52,62).trim()} ${line.slice(62,80).trim()}`.trim(),
+        origen: 'Norma43',
+        _directionConfidence:'Norma43 D/H'
       });
     } else if(type === '23' || type === '24'){
       if(txs.length){
         const extra = line.slice(4).trim();
-        txs[txs.length-1].contraparte = (txs[txs.length-1].contraparte + ' ' + extra).trim();
+        txs[txs.length-1].concepto = (txs[txs.length-1].concepto + ' ' + extra).trim();
+        const iban = extra.toUpperCase().replace(/\s+/g,'').match(/[A-Z]{2}\d{2}[A-Z0-9]{10,30}/)?.[0];
+        if(iban) txs[txs.length-1].contraparte = iban;
       }
     }
     // 33 (cierre) y 88 (fin fichero) se ignoran para la lista de movimientos
@@ -1027,142 +1057,89 @@ let currentFilterAccount = null;
 let selectedTxIds = new Set();
 let graphMode = 'all'; // 'all' | 'in' | 'out' | 'manual'
 
-function cleanCell(value){
-  if(value === null || value === undefined) return '';
-  return String(value).replace(/\u00a0/g,' ').replace(/[\t\r\n]+/g,' ').replace(/\s{2,}/g,' ').trim();
-}
-function foldText(value){
-  return cleanCell(value).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
-}
-function headerKey(value){ return foldText(value).replace(/[^a-z0-9]+/g,''); }
-
-const HEADER_ALIASES = {
-  fecha:['fecha','fecha operacion','f operacion','fecha movimiento','fecha contable','fecha contabilizacion','date','booking date','transaction date'],
-  fechaValor:['fecha valor','f valor','value date','valuta'],
-  cuenta:['iban','cuenta','n cuenta','numero cuenta','nº cuenta','account','account number','cta'],
-  contraparte:['contraparte','beneficiario','ordenante','titular','tercero','nombre beneficiario','nombre ordenante','destinatario','remitente','counterparty','beneficiary','payer','payee'],
-  concepto:['concepto','descripcion','descripción','detalle','observaciones','texto','movimiento','concept','description','memo','narrative','descripcion ampliada'],
-  importe:['importe','cantidad','amount','monto','valor','importe eur','importe movimiento','importe operacion','importe operación'],
-  debe:['debe','cargo','cargos','debito','débito','debit','withdrawal','importe debe','importe cargo'],
-  haber:['haber','abono','abonos','credito','crédito','credit','deposit','importe haber','importe abono'],
-  saldo:['saldo','balance','saldo disponible','saldo contable'],
-  referencia:['referencia','ref','referencia operacion','n referencia','numero referencia','id operacion','transaction id','id movimiento'],
-  tipo:['tipo','tipo movimiento','clase','signo','naturaleza','cargo abono','debe haber','d h','operation type','transaction type'],
-  divisa:['divisa','moneda','currency']
-};
-function guessField(header){
-  const h = foldText(header), k = headerKey(header);
-  let best = 'ignorar', bestScore = 0;
-  for(const [target, aliases] of Object.entries(HEADER_ALIASES)){
-    for(const alias of aliases){
-      const a = foldText(alias), ak = headerKey(alias);
-      let score = 0;
-      if(k === ak) score = 100;
-      else if(k && ak && (k.includes(ak) || ak.includes(k))) score = Math.min(k.length,ak.length) >= 4 ? 70 : 0;
-      else if(h.includes(a)) score = 55;
-      if(score > bestScore){ bestScore=score; best=target; }
-    }
-  }
-  return best;
-}
-function headerRowScore(row){
-  if(!Array.isArray(row)) return -1;
-  const guesses = row.map(guessField).filter(x=>x!=='ignorar');
-  const unique = new Set(guesses);
-  let score = unique.size * 5 + guesses.length;
-  if(unique.has('fecha')) score += 6;
-  if(unique.has('importe') || unique.has('debe') || unique.has('haber')) score += 8;
-  if(unique.has('concepto') || unique.has('contraparte')) score += 3;
-  return score;
-}
-function dedupeHeaders(row){
-  const seen = {};
-  return row.map((v,i)=>{
-    let h = cleanCell(v) || `Columna ${i+1}`;
-    seen[h] = (seen[h]||0)+1;
-    return seen[h] > 1 ? `${h} (${seen[h]})` : h;
+function uniqueHeaders(headers){
+  const used = {};
+  return headers.map((h,i)=>{
+    const base=String(h==null?'':h).trim() || `columna_${i+1}`;
+    used[base]=(used[base]||0)+1;
+    return used[base]===1 ? base : `${base}_${used[base]}`;
   });
 }
-function matrixToRows(matrix, headerIndex){
-  const headers = dedupeHeaders(matrix[headerIndex] || []);
-  const rows = [];
-  for(const arr of matrix.slice(headerIndex+1)){
-    if(!arr || !arr.some(v=>cleanCell(v)!=='')) continue;
-    const obj = {};
-    headers.forEach((h,i)=>{ obj[h] = arr[i] ?? ''; });
-    rows.push(obj);
-  }
-  return {headers, rows};
+function headerQuality(cells){
+  const text=normalizeText(cells.join(' | '));
+  const terms=['fecha','date','concept','descrip','detalle','importe','amount','cargo','debe','debit','abono','haber','credit','saldo','balance','iban','cuenta','account','benefici','ordenante','contrapart','referenc'];
+  return terms.reduce((n,t)=>n+(text.includes(t)?1:0),0) + cells.filter(v=>String(v||'').trim()).length*.03;
 }
-function detectMatrixHeader(matrix, maxScan=30){
-  let bestIndex=0, bestScore=-1;
-  for(let i=0;i<Math.min(matrix.length,maxScan);i++){
-    const score = headerRowScore(matrix[i]);
-    if(score>bestScore){ bestScore=score; bestIndex=i; }
-  }
-  return {index:bestIndex, score:bestScore};
+function matrixToTable(matrix){
+  const clean=matrix.filter(row=>Array.isArray(row)&&row.some(v=>String(v??'').trim()));
+  if(!clean.length) return {rows:[],headers:[],headerIndex:0};
+  let headerIndex=0,best=-1;
+  clean.slice(0,30).forEach((row,i)=>{ const score=headerQuality(row); if(score>best){best=score;headerIndex=i;} });
+  const headers=uniqueHeaders(clean[headerIndex].map(v=>String(v??'').trim()));
+  const rows=clean.slice(headerIndex+1).map(row=>Object.fromEntries(headers.map((h,i)=>[h,row[i]??''])))
+    .filter(row=>Object.values(row).some(v=>String(v??'').trim()));
+  return {rows,headers,headerIndex};
+}
+function decodeBankText(buffer){
+  const utf8=new TextDecoder('utf-8').decode(buffer);
+  const replacements=(utf8.match(/�/g)||[]).length;
+  if(replacements===0) return utf8.replace(/^\uFEFF/,'');
+  try{return new TextDecoder('windows-1252').decode(buffer).replace(/^\uFEFF/,'');}catch{return utf8.replace(/^\uFEFF/,'');}
 }
 function parseDelimitedBankText(text){
-  const cleaned = text.replace(/^\uFEFF/,'');
-  const candidates = [',',';','\t','|'];
-  let best = null;
-  for(const delimiter of candidates){
-    const parsed = Papa.parse(cleaned,{header:false,skipEmptyLines:'greedy',dynamicTyping:false,delimiter});
-    const matrix = parsed.data || [];
-    if(!matrix.length) continue;
-    const detected = detectMatrixHeader(matrix,35);
-    const width = Math.max(...matrix.slice(detected.index,detected.index+6).map(r=>Array.isArray(r)?r.length:0),0);
-    const consistency = matrix.slice(detected.index,detected.index+12).filter(r=>Array.isArray(r)&&r.length===width).length;
-    const score = detected.score*10 + Math.min(width,20) + consistency;
-    if(width>=2 && (!best || score>best.score)) best={matrix,headerIndex:detected.index,score,delimiter};
+  const lines=text.replace(/^\uFEFF/,'').split(/\r?\n/).filter(l=>l.trim());
+  if(!lines.length) return {rows:[],headers:[],headerIndex:0,delimiter:''};
+  let headerIndex=0,best=-1;
+  lines.slice(0,30).forEach((line,i)=>{
+    const cells=line.split(/\t|;|,|\|/);
+    const score=headerQuality(cells)+(cells.length>2?1:0);
+    if(score>best){best=score;headerIndex=i;}
+  });
+  const candidate=lines.slice(headerIndex).join('\n');
+  let parsed=Papa.parse(candidate,{header:true,skipEmptyLines:'greedy',dynamicTyping:false,transformHeader:h=>String(h).trim()});
+  let headers=parsed.meta.fields||[];
+  if(headers.length<2){
+    const matrix=lines.map(line=>line.trim().split(/\t|\s{2,}|\|/));
+    const tab=matrixToTable(matrix);
+    return {...tab,delimiter:'espacios/tabuladores'};
   }
-  if(!best){
-    const parsed=Papa.parse(cleaned,{header:false,skipEmptyLines:'greedy',dynamicTyping:false});
-    const detected=detectMatrixHeader(parsed.data||[],35);
-    best={matrix:parsed.data||[],headerIndex:detected.index,score:detected.score,delimiter:parsed.meta?.delimiter||''};
-  }
-  return {...matrixToRows(best.matrix,best.headerIndex), headerIndex:best.headerIndex, delimiter:best.delimiter};
+  headers=uniqueHeaders(headers);
+  const original=parsed.meta.fields||[];
+  const rows=parsed.data.map(row=>Object.fromEntries(headers.map((h,i)=>[h,row[original[i]]??''])));
+  return {rows,headers,headerIndex,delimiter:parsed.meta.delimiter||'auto'};
 }
-function excelSerialToDate(v){
-  if(typeof v !== 'number' || !Number.isFinite(v) || v < 1 || v > 100000) return null;
-  const d = XLSX.SSF.parse_date_code(v);
-  if(!d || !d.y || !d.m || !d.d) return null;
-  return `${String(d.d).padStart(2,'0')}/${String(d.m).padStart(2,'0')}/${d.y}`;
+
+function loadBankTable(rows,headers,format,status){
+  rawParsedRows=rows; rawHeaders=headers; sourceFormat=format;
+  status.innerHTML=`<span class="badge ok">leído</span> ${rows.length} filas · ${escapeHtml(format)} · cabecera detectada automáticamente`;
+  showMappingPanel();
 }
-function normalizeDateValue(value){
-  if(value instanceof Date && !isNaN(value)) return `${String(value.getDate()).padStart(2,'0')}/${String(value.getMonth()+1).padStart(2,'0')}/${value.getFullYear()}`;
-  const excel = excelSerialToDate(value); if(excel) return excel;
-  let s=cleanCell(value); if(!s) return '';
-  let m=s.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:[ T].*)?$/);
-  if(m) return `${m[3].padStart(2,'0')}/${m[2].padStart(2,'0')}/${m[1]}`;
-  m=s.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})(?:[ T].*)?$/);
-  if(m){ let y=m[3]; if(y.length===2) y=(Number(y)>=70?'19':'20')+y; return `${m[1].padStart(2,'0')}/${m[2].padStart(2,'0')}/${y}`; }
-  return s;
+
+function parseOfx(text){
+  const account=(text.match(/<ACCTID>\s*([^<\r\n]+)/i)||[])[1]?.trim()||'(sin identificar)';
+  const blocks=text.match(/<STMTTRN>[\s\S]*?<\/STMTTRN>/gi)||text.split(/<STMTTRN>/i).slice(1);
+  const field=(block,tag)=>(block.match(new RegExp(`<${tag}>\\s*([^<\\r\\n]+)`,'i'))||[])[1]?.trim()||'';
+  return blocks.map(b=>({
+    fecha:normalizeBankDate(field(b,'DTPOSTED').slice(0,8)),cuenta:account,
+    contraparte:field(b,'NAME')||'(sin identificar)',concepto:[field(b,'NAME'),field(b,'MEMO')].filter(Boolean).join(' · '),
+    importe:parseMoney(field(b,'TRNAMT')),saldo:'',referencia:field(b,'FITID')||field(b,'CHECKNUM'),origen:'OFX',
+    _directionKnown:true,_directionConfidence:'signo OFX'
+  })).filter(t=>t.importe!==0);
 }
-function extractAccountLike(text){
-  const s=cleanCell(text).toUpperCase();
-  if(!s) return '';
-  const compact=s.replace(/[\s-]+/g,'');
-  const iban=compact.match(/[A-Z]{2}\d{2}[A-Z0-9]{11,30}/);
-  if(iban) return iban[0];
-  const ccc=compact.match(/(?:^|\D)(\d{20})(?:\D|$)/); if(ccc) return ccc[1];
-  return '';
-}
-function classifyDirection(value){
-  const s=foldText(value);
-  if(!s) return 0;
-  if(/cargo|debe|debito|debit|salida|pago|emitid|enviad|withdraw|outgoing|^d$|^dr$/.test(s)) return -1;
-  if(/abono|haber|credito|credit|entrada|ingreso|recibid|deposit|incoming|^h$|^cr$/.test(s)) return 1;
-  return 0;
-}
-function joinValues(row, cols, sep=' · '){
-  const vals=[];
-  (cols||[]).forEach(c=>{ const v=cleanCell(row[c]); if(v && !vals.includes(v)) vals.push(v); });
-  return vals.join(sep);
+function parseQif(text){
+  const cleaned=text.split(/\r?\n/).filter(line=>!line.startsWith('!')).join('\n');
+  const records=cleaned.split(/^\^\s*$/m).map(s=>s.trim()).filter(Boolean);
+  return records.map(block=>{
+    const get=prefix=>block.split(/\r?\n/).find(l=>l.startsWith(prefix))?.slice(prefix.length).trim()||'';
+    const amount=get('T');
+    return {fecha:normalizeBankDate(get('D')),cuenta:'(sin identificar)',contraparte:get('P')||'(sin identificar)',
+      concepto:[get('P'),get('M'),get('L')].filter(Boolean).join(' · '),importe:parseMoney(amount),saldo:'',referencia:get('N'),origen:'QIF',
+      _directionKnown:true,_directionConfidence:'signo QIF'};
+  }).filter(t=>t.importe!==0);
 }
 
 function handleBankFile(evt){
-  const file = evt.target.files[0];
+  const file = evt instanceof File ? evt : evt?.target?.files?.[0];
   if(!file) return;
   const statusEl = document.getElementById('bankFileStatus');
   const ext = file.name.split('.').pop().toLowerCase();
@@ -1170,25 +1147,14 @@ function handleBankFile(evt){
   if(ext === 'xlsx' || ext === 'xls'){
     const reader = new FileReader();
     reader.onload = e=>{
-      try{
-        const wb = XLSX.read(new Uint8Array(e.target.result), {type:'array',cellDates:true});
-        let best=null;
-        wb.SheetNames.forEach(name=>{
-          const matrix=XLSX.utils.sheet_to_json(wb.Sheets[name],{header:1,defval:'',raw:true,blankrows:false});
-          if(!matrix.length) return;
-          const detected=detectMatrixHeader(matrix,35);
-          const converted=matrixToRows(matrix,detected.index);
-          const meaningful=converted.rows.filter(r=>Object.values(r).some(v=>cleanCell(v)!=='')).length;
-          const score=detected.score*100 + Math.min(meaningful,999);
-          if(!best || score>best.score) best={name,matrix,detected,converted,score};
-        });
-        if(!best) throw new Error('No se encontraron filas utilizables en el libro.');
-        rawParsedRows=best.converted.rows;
-        rawHeaders=best.converted.headers;
-        sourceFormat='XLSX';
-        statusEl.innerHTML=`<span class="badge ok">leído</span> ${rawParsedRows.length} filas · hoja "${escapeHtml(best.name)}" · cabecera detectada en fila ${best.detected.index+1}`;
-        showMappingPanel();
-      }catch(err){ statusEl.innerHTML=`<span class="badge bad">error</span> ${escapeHtml(err.message||'No se pudo leer el Excel')}`; }
+      const wb = XLSX.read(new Uint8Array(e.target.result), {type:'array'});
+      const candidates=wb.SheetNames.map(name=>{
+        const matrix=XLSX.utils.sheet_to_json(wb.Sheets[name],{header:1,defval:'',raw:false,dateNF:'yyyy-mm-dd'});
+        const table=matrixToTable(matrix);
+        return {name,...table,score:table.rows.length*(table.headers.length>2?1:0.2)+headerQuality(table.headers)};
+      }).sort((a,b)=>b.score-a.score);
+      const chosen=candidates[0]||{name:'',rows:[],headers:[]};
+      loadBankTable(chosen.rows,chosen.headers,`${ext.toUpperCase()} · hoja ${chosen.name}`,statusEl);
     };
     reader.readAsArrayBuffer(file);
     return;
@@ -1196,31 +1162,51 @@ function handleBankFile(evt){
 
   const reader = new FileReader();
   reader.onload = e=>{
-    const text = e.target.result;
-    const firstLines = text.split(/\r?\n/).slice(0,8).map(l=>l.trim()).filter(Boolean);
-    const n43Hits=firstLines.filter(l=>/^(11|22|23|24|33|88)/.test(l)).length;
-    const looksN43 = firstLines.length>=2 && n43Hits/firstLines.length>=0.75;
+    const text = decodeBankText(e.target.result);
+    // detección Norma43: líneas de 80 chars empezando por 11/22/23/24/33/88
+    const firstLines = text.split(/\r?\n/).slice(0,5).filter(l=>l.length>0);
+    const looksN43 = firstLines.length && firstLines.every(l => /^(11|22|23|24|33|88)/.test(l));
     if(looksN43){
       const txs = parseNorma43(text);
-      sourceFormat = 'Norma43'; normalizedTx = txs;
-      statusEl.innerHTML = `<span class="badge ok">Norma 43 detectada</span> ${txs.length} movimientos extraídos.`;
-      document.getElementById('mappingPanel').style.display='none'; finishNormalization(); return;
+      sourceFormat = 'Norma43';
+      normalizedTx = txs;
+      statusEl.innerHTML = `<span class="badge ok">Norma 43 detectada</span> ${txs.length} movimientos extraídos. Ver aviso en Inicio: anchos de campo por mejor esfuerzo, revisa antes de usar como prueba.`;
+      document.getElementById('mappingPanel').style.display='none';
+      finishNormalization();
+      return;
     }
-    try{
-      const parsed=parseDelimitedBankText(text);
-      rawParsedRows=parsed.rows; rawHeaders=parsed.headers;
-      sourceFormat=ext==='txt'?'TXT':'CSV';
-      const delimName=parsed.delimiter==='\t'?'TAB':(parsed.delimiter||'auto');
-      statusEl.innerHTML=`<span class="badge ok">leído</span> ${rawParsedRows.length} filas · ${sourceFormat} · separador ${escapeHtml(delimName)} · cabecera fila ${parsed.headerIndex+1}`;
-      showMappingPanel();
-    }catch(err){ statusEl.innerHTML=`<span class="badge bad">error</span> ${escapeHtml(err.message||'No se pudo interpretar el fichero')}`; }
+    if(ext==='ofx'){
+      normalizedTx=parseOfx(text); sourceFormat='OFX'; document.getElementById('mappingPanel').style.display='none';
+      statusEl.innerHTML=`<span class="badge ok">OFX detectado</span> ${normalizedTx.length} movimientos extraídos.`; finishNormalization(); return;
+    }
+    if(ext==='qif'){
+      normalizedTx=parseQif(text); sourceFormat='QIF'; document.getElementById('mappingPanel').style.display='none';
+      statusEl.innerHTML=`<span class="badge ok">QIF detectado</span> ${normalizedTx.length} movimientos extraídos.`; finishNormalization(); return;
+    }
+    const parsed=parseDelimitedBankText(text);
+    loadBankTable(parsed.rows,parsed.headers,`${ext==='txt'?'TXT':'CSV'} · separador ${parsed.delimiter}`,statusEl);
   };
-  reader.readAsText(file);
+  reader.readAsArrayBuffer(file);
 }
 
-const FIELD_TARGETS = ['fecha','fechaValor','cuenta','contraparte','concepto','importe','debe','haber','saldo','referencia','tipo','divisa','ignorar'];
+const FIELD_TARGETS = ['fecha','cuenta','contraparte','concepto','importe','debe','haber','saldo','sentido','referencia','ignorar'];
+function guessField(header){
+  const h = normalizeText(header).replace(/[^a-z0-9]+/g,' ');
+  if(/benefici|ordenante|contrapart|counterpart|destinat|remitente|tercero|nombre contraparte|cuenta destino|cuenta origen/.test(h)) return 'contraparte';
+  if(/fecha|date|f oper|fec mov/.test(h) && !/saldo/.test(h)) return 'fecha';
+  if(/iban|numero de cuenta|n cuenta|account number|cuenta titular|cuenta propia/.test(h)) return 'cuenta';
+  if(/concepto|descripcion|detalle|narrative|memo|observacion|transaction description|movimiento/.test(h)) return 'concepto';
+  if(/^(debe|cargo|cargos|debito|debit|withdrawal|outflow)$/.test(h.trim())) return 'debe';
+  if(/^(haber|abono|abonos|credito|credit|deposit|inflow)$/.test(h.trim())) return 'haber';
+  if(/saldo|balance|running balance/.test(h)) return 'saldo';
+  if(/tipo movimiento|sentido|signo|debe haber|debito credito|credit debit|dr cr|indicador|movement type/.test(h)) return 'sentido';
+  if(/importe|cantidad|amount|monto|valor|quantity/.test(h)) return 'importe';
+  if(/referenc|numero operacion|id operacion|transaction id|documento|justificante|ref$/.test(h)) return 'referencia';
+  return 'ignorar';
+}
 function showMappingPanel(){
-  const panel = document.getElementById('mappingPanel'); panel.style.display = 'block';
+  const panel = document.getElementById('mappingPanel');
+  panel.style.display = 'block';
   const rows = document.getElementById('mappingRows');
   rows.innerHTML = rawHeaders.map(h=>{
     const guess = guessField(h);
@@ -1229,54 +1215,98 @@ function showMappingPanel(){
   }).join('');
 }
 
+function normalizeBankDate(value){
+  if(value instanceof Date && !isNaN(value)) return value.toISOString().slice(0,10);
+  if(typeof value==='number' && value>20000 && value<80000){
+    const d=new Date(Date.UTC(1899,11,30)+value*86400000); return d.toISOString().slice(0,10);
+  }
+  const s=String(value??'').trim();
+  if(/^\d{8}$/.test(s)){
+    if(Number(s.slice(0,4))>1900) return `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}`;
+    return `${s.slice(4,8)}-${s.slice(2,4)}-${s.slice(0,2)}`;
+  }
+  return s;
+}
+function directionFromMarker(value){
+  const s=normalizeText(value).replace(/[^a-z0-9+\-]/g,'');
+  if(!s) return 0;
+  if(/^(d|dr|db|dbit|debe|debit|debito|deudor|cargo|adeudo|salida|out|withdrawal|1|\-)$/.test(s)) return -1;
+  if(/^(h|cr|crdt|a|haber|credit|credito|acreedor|abono|ingreso|entrada|in|deposit|2|\+)$/.test(s)) return 1;
+  return 0;
+}
+function directionFromConcept(value){
+  const s=normalizeText(value);
+  const out=/\b(cargo|adeudo|recibo|pago|compra|retirada|reintegro cajero|comision|transferencia emitida|transferencia enviada|domiciliacion)\b/.test(s);
+  const inc=/\b(abono|ingreso|nomina|pension|transferencia recibida|cobro|intereses a favor|devolucion recibida)\b/.test(s);
+  return out&&!inc?-1:inc&&!out?1:0;
+}
+function extractIbanFromValues(values, own=''){
+  const ownId=normalizeAccountId(own);
+  const text=values.map(v=>String(v??'').toUpperCase()).join(' ');
+  const matches=text.match(/[A-Z]{2}\s*\d{2}(?:[\s-]*[A-Z0-9]){10,30}/g)||[];
+  return matches.map(normalizeAccountId).find(v=>v!==ownId)||'';
+}
+function inferSignsFromBalances(rows){
+  const groups=new Map();
+  rows.forEach((t,i)=>{ const k=normalizeAccountId(t.cuenta)||'__all__'; if(!groups.has(k))groups.set(k,[]); groups.get(k).push({t,i,date:parseFechaLoose(t.fecha)}); });
+  groups.forEach(group=>{
+    const dated=group.filter(x=>x.date&&!isNaN(x.date)).sort((a,b)=>a.date-b.date||a.i-b.i);
+    for(let j=1;j<dated.length;j++){
+      const prev=dated[j-1].t,cur=dated[j].t;
+      if(cur._directionKnown||!Number.isFinite(cur._balanceNumber)||!Number.isFinite(prev._balanceNumber)) continue;
+      const delta=cur._balanceNumber-prev._balanceNumber, magnitude=Math.abs(cur.importe);
+      const tolerance=Math.max(.02,magnitude*.002);
+      if(magnitude>0&&Math.abs(Math.abs(delta)-magnitude)<=tolerance){ cur.importe=delta<0?-magnitude:magnitude; cur._directionKnown=true; cur._directionConfidence='variación de saldo'; }
+    }
+  });
+}
+
 function normalizeTransactions(){
   const selects = document.querySelectorAll('#mappingRows select');
-  const map = {}; selects.forEach(s=>{ map[s.dataset.header] = s.value; });
-  const findCols = target => Object.keys(map).filter(h=>map[h]===target);
-  const fechaCols=findCols('fecha'), fechaValorCols=findCols('fechaValor'), cuentaCols=findCols('cuenta'), contraCols=findCols('contraparte'),
-        conceptoCols=findCols('concepto'), importeCols=findCols('importe'), debeCols=findCols('debe'), haberCols=findCols('haber'),
-        saldoCols=findCols('saldo'), refCols=findCols('referencia'), tipoCols=findCols('tipo'), divisaCols=findCols('divisa');
-
-  let dropped=0, inferredSign=0, extractedAccount=0;
+  const map = {};
+  selects.forEach(s=>{ map[s.dataset.header] = s.value; });
+  const cols=target=>Object.keys(map).filter(h=>map[h]===target);
+  const first=(r,target)=>{ for(const h of cols(target)){ if(String(r[h]??'').trim())return r[h]; } return ''; };
+  const joined=(r,target)=>cols(target).map(h=>String(r[h]??'').trim()).filter(Boolean).join(' · ');
   normalizedTx = rawParsedRows.map(r=>{
-    const concepto=joinValues(r,conceptoCols,' | ');
-    const tipo=joinValues(r,tipoCols,' ');
-    let importe=0;
-    const debitValues=debeCols.map(c=>parseMoney(r[c])).filter(v=>v!==0);
-    const creditValues=haberCols.map(c=>parseMoney(r[c])).filter(v=>v!==0);
-    if(debitValues.length || creditValues.length){
-      importe=creditValues.reduce((a,v)=>a+Math.abs(v),0)-debitValues.reduce((a,v)=>a+Math.abs(v),0);
-    } else if(importeCols.length){
-      for(const c of importeCols){ const v=parseMoney(r[c]); if(v!==0){ importe=v; break; } }
-      const dir=classifyDirection(tipo);
-      if(dir && importe!==0 && Math.sign(importe)!==dir){ importe=Math.abs(importe)*dir; inferredSign++; }
+    const fecha=normalizeBankDate(first(r,'fecha'));
+    const cuenta=String(first(r,'cuenta')||'').trim();
+    const concepto=joined(r,'concepto');
+    const referencia=joined(r,'referencia');
+    const saldoRaw=first(r,'saldo'), balance=String(saldoRaw??'').trim()===''?NaN:parseMoney(saldoRaw);
+    const debeVals=cols('debe').map(h=>parseMoney(r[h])).filter(v=>v!==0);
+    const haberVals=cols('haber').map(h=>parseMoney(r[h])).filter(v=>v!==0);
+    const amountRaw=first(r,'importe');
+    let importe=0, known=false, confidence='';
+    if(debeVals.length||haberVals.length){
+      importe=haberVals.reduce((a,v)=>a+Math.abs(v),0)-debeVals.reduce((a,v)=>a+Math.abs(v),0);
+      known=true; confidence='columnas debe/haber';
+    }else{
+      importe=parseMoney(amountRaw);
+      const marker=directionFromMarker(joined(r,'sentido'));
+      const rawString=String(amountRaw??'').trim();
+      const explicitNegative=/^\s*-|\-\s*$|^\s*\(/.test(rawString);
+      if(marker){importe=Math.abs(importe)*marker;known=true;confidence='indicador cargo/abono';}
+      else if(explicitNegative){importe=-Math.abs(importe);known=true;confidence='signo explícito';}
+      else if(/^\s*\+/.test(rawString)){importe=Math.abs(importe);known=true;confidence='signo explícito';}
     }
+    let contraparte=joined(r,'contraparte');
+    if(!contraparte) contraparte=extractIbanFromValues(Object.values(r),cuenta);
+    const allText=Object.values(r).map(v=>String(v??'')).join(' ');
+    return {fecha,cuenta:cuenta||'(sin identificar)',contraparte:contraparte||'(sin identificar)',concepto:concepto||allText.slice(0,300),importe,
+      saldo:String(saldoRaw??'').trim(),referencia,origen:sourceFormat,_balanceNumber:balance,_directionKnown:known,_directionConfidence:confidence};
+  }).filter(t=>Number.isFinite(t.importe)&&Math.abs(t.importe)>0&&!/^(total|subtotal|saldo inicial|saldo anterior)$/i.test((t.concepto||'').trim()));
 
-    let cuenta=joinValues(r,cuentaCols,' ');
-    const extractedOwn=extractAccountLike(cuenta); if(extractedOwn) cuenta=extractedOwn;
-    let contraparte=joinValues(r,contraCols,' | ');
-    let cpAccount=extractAccountLike(contraparte) || extractAccountLike(concepto);
-    if(cpAccount && (!contraparte || !extractAccountLike(contraparte))){ contraparte=cpAccount; extractedAccount++; }
-    else if(cpAccount && contraparte && !contraparte.includes(cpAccount)) contraparte=`${contraparte} · ${cpAccount}`;
-
-    const fechaRaw=fechaCols.length ? r[fechaCols.find(c=>cleanCell(r[c])) || fechaCols[0]] : '';
-    const fvRaw=fechaValorCols.length ? r[fechaValorCols.find(c=>cleanCell(r[c])) || fechaValorCols[0]] : '';
-    const saldoVal=saldoCols.length ? r[saldoCols.find(c=>cleanCell(r[c])) || saldoCols[0]] : '';
-    const ref=joinValues(r,refCols,' | ');
-    const divisa=joinValues(r,divisaCols,' ');
-    const emptyMeaningful=!normalizeDateValue(fechaRaw) && !concepto && !contraparte && importe===0 && !ref;
-    if(emptyMeaningful){ dropped++; return null; }
-    return {
-      fecha: normalizeDateValue(fechaRaw), fechaValor: normalizeDateValue(fvRaw),
-      cuenta: cleanCell(cuenta) || '(sin identificar)', contraparte: cleanCell(contraparte) || '(sin identificar)',
-      concepto, importe, saldo: saldoVal===''?'':parseMoney(saldoVal), referencia:ref, tipo, divisa,
-      origen: sourceFormat
-    };
-  }).filter(Boolean);
-  const statusEl=document.getElementById('bankFileStatus');
-  if(statusEl) statusEl.innerHTML += ` <span class="badge ok">normalizado</span> ${normalizedTx.length} movimientos${inferredSign?` · ${inferredSign} signos inferidos`:''}${extractedAccount?` · ${extractedAccount} cuentas extraídas`:''}${dropped?` · ${dropped} filas vacías descartadas`:''}`;
+  inferSignsFromBalances(normalizedTx);
+  normalizedTx.forEach(t=>{
+    if(t._directionKnown) return;
+    const sign=directionFromConcept(t.concepto);
+    if(sign){t.importe=Math.abs(t.importe)*sign;t._directionKnown=true;t._directionConfidence='texto del concepto';}
+    else {t.importe=Math.abs(t.importe);t._directionConfidence='sentido no determinado';}
+  });
   finishNormalization();
 }
+
 function finishNormalization(){
   document.getElementById('statsPanel').style.display='block';
   document.getElementById('summaryPanel').style.display='block';
@@ -1301,13 +1331,15 @@ function finishNormalization(){
 
   const total = normalizedTx.length;
   const totalIn = normalizedTx.filter(t=>t.importe>0).reduce((a,t)=>a+t.importe,0);
-  const totalOut = normalizedTx.filter(t=>t.importe<0).reduce((a,t)=>a+t.importe,0);
+  const totalOut = normalizedTx.filter(t=>t.importe<0).reduce((a,t)=>a+Math.abs(t.importe),0);
+  const uncertain = normalizedTx.filter(t=>!t._directionKnown).length;
   const accounts = new Set(normalizedTx.map(t=>t.cuenta));
   document.getElementById('statsRow').innerHTML = `
     <div class="stat"><div class="n">${total}</div><div class="l">movimientos</div></div>
     <div class="stat"><div class="n" style="color:#8fbf8f;">${totalIn.toFixed(2)}</div><div class="l">total entradas</div></div>
     <div class="stat"><div class="n" style="color:#e08a7a;">${totalOut.toFixed(2)}</div><div class="l">total salidas</div></div>
     <div class="stat"><div class="n">${accounts.size}</div><div class="l">cuentas propias detectadas</div></div>
+    <div class="stat"><div class="n" style="color:${uncertain?'#a66b00':'#287a4b'};">${uncertain}</div><div class="l">sentido por revisar</div></div>
   `;
 
   renderSummary();
@@ -1379,6 +1411,10 @@ function renderSummary(){
 
   // señales a revisar (heurísticas, no conclusiones)
   const flags = [];
+  const uncertain = tx.filter(t=>!t._directionKnown);
+  if(uncertain.length){
+    flags.push({level:'warn', text:`${uncertain.length} movimiento(s) no permiten determinar con certeza si son cargo o abono. Se muestran como entrada provisional: revisa el mapeo, el signo o la columna de saldo antes de usar el grafo.`});
+  }
   const nearThreshold = tx.filter(t => Math.abs(t.importe) >= 2850 && Math.abs(t.importe) < 3000);
   if(nearThreshold.length >= 2){
     flags.push({level:'warn', text:`${nearThreshold.length} movimientos justo por debajo de 3.000 € — patrón que puede merecer revisión por posible fraccionamiento.`});
@@ -1533,7 +1569,7 @@ function openMovementDetail(link, txs, investigatedId){
     <div class="k">Cuenta investigada</div><div class="v">${escapeHtml(investigatedId)}</div>
     <div class="k">Contraparte</div><div class="v">${escapeHtml(first.contraparte||'—')}</div>
     <div class="k">Movimientos agrupados</div><div class="v">${link.count||txs.length||1}</div>
-  </div><div class="tablewrap" style="max-height:330px;margin-top:16px;"><table><thead><tr><th>Fecha</th><th>Sentido</th><th>Importe</th><th>Contraparte</th><th>Concepto</th><th>Referencia</th></tr></thead><tbody>${rows}</tbody></table></div>${txs.length>100?'<div class="note">Se muestran los primeros 100 movimientos.</div>':''}`;
+  </div>${first.contraparte&&first.contraparte!=='(sin identificar)'?dorkButtons([['Google · contraparte exacta',`"${first.contraparte}"`],['Google · documentos',`"${first.contraparte}" (filetype:pdf OR filetype:xls OR filetype:xlsx)`]]):''}<div class="tablewrap" style="max-height:330px;margin-top:16px;"><table><thead><tr><th>Fecha</th><th>Sentido</th><th>Importe</th><th>Contraparte</th><th>Concepto</th><th>Referencia</th></tr></thead><tbody>${rows}</tbody></table></div>${txs.length>100?'<div class="note">Se muestran los primeros 100 movimientos.</div>':''}`;
   modal.classList.add('open');
   modal.querySelector('.movement-dialog-close')?.focus();
 }
@@ -1569,12 +1605,13 @@ function buildTxGraph(){
     onNodeClick: (nodeId, n) => {
       currentFilterAccount = n.own ? null : nodeId;
       renderTxTable();
+      const nodeValue=n.fullLabel||n.label;
       document.getElementById('nodeDetail').innerHTML = `<div class="panel-mini"><div class="kv">
         <div class="k">Nodo</div><div class="v">${escapeHtml(n.fullLabel||n.label)}${n.own?' <span class="badge ok">cuenta investigada</span>':''}</div>
         <div class="k">Total entradas</div><div class="v pos">${fmtEUR(n.in)} €</div>
         <div class="k">Total salidas</div><div class="v neg">${fmtEUR(Math.abs(n.out))} €</div>
         <div class="k">Volumen total</div><div class="v">${fmtEUR(n.flow)} €</div>
-      </div></div>`;
+      </div>${dorkButtons([['Google · nodo exacto',`"${nodeValue}"`],['Google · documentos',`"${nodeValue}" (filetype:pdf OR filetype:xls OR filetype:xlsx)`]])}</div>`;
     }
   });
   const omittedByAmount = source.length - represented;
@@ -1608,6 +1645,7 @@ function renderForceGraph(containerId, nodes, links, opts={}){
   }
 
   const g = svg.append('g');
+  const linkUnit = opts.linkUnit === undefined ? ' €' : (opts.linkUnit ? ` ${opts.linkUnit}` : '');
   const maxVal = d3.max(links, l=>l.value) || 1;
   const maxFlow = d3.max(nodes, n=>n.flow||1) || 1;
   const radius = n => n.own ? 25 : 13 + 7 * Math.sqrt(Math.max(0,n.flow||0) / maxFlow);
@@ -1631,8 +1669,8 @@ function renderForceGraph(containerId, nodes, links, opts={}){
     .style('pointer-events','stroke').style('cursor',opts.onLinkClick?'pointer':'default')
     .on('click',(event,l)=>{ event.stopPropagation(); if(opts.onLinkClick) opts.onLinkClick(l); });
   linkSel.append('title').text(l => l.count>1
-    ? `${l.count} movimiento(s) · ${fmtEUR(l.value)} €`
-    : `${l.credit?'ENTRADA':'SALIDA'} · ${fmtEUR(l.value)} €${l.fecha?' · '+l.fecha:''}${l.concepto?' · '+l.concepto:''}${l.referencia?' · ref: '+l.referencia:''}`);
+    ? `${l.count} movimiento(s) · ${fmtEUR(l.value)}${linkUnit}`
+    : `${l.credit?'ENTRADA':'SALIDA'} · ${fmtEUR(l.value)}${linkUnit}${l.fecha?' · '+l.fecha:''}${l.concepto?' · '+l.concepto:''}${l.referencia?' · ref: '+l.referencia:''}`);
   const linkHitSel = opts.onLinkClick ? g.append('g').selectAll('path').data(links).enter().append('path')
     .attr('fill','none').attr('stroke','transparent').attr('stroke-width',18)
     .style('pointer-events','stroke').style('cursor','pointer')
@@ -1640,7 +1678,7 @@ function renderForceGraph(containerId, nodes, links, opts={}){
   if(linkHitSel) linkHitSel.append('title').text('Pulsar para ver el detalle de la relación');
 
   const linkLabelSel = opts.linkLabels ? g.append('g').selectAll('text').data(links).enter().append('text')
-    .text(l=>`${fmtEUR(l.value)} €`)
+    .text(l=>`${fmtEUR(l.value)}${linkUnit}`)
     .attr('class','graph-amount-label').attr('font-size',11).attr('fill','#071a33').attr('font-family','var(--mono)').attr('font-weight',700)
     .attr('text-anchor','middle').attr('dy',-5)
     .style('paint-order','stroke').style('stroke','#fff').style('stroke-width','5px').style('stroke-linejoin','round')
@@ -1739,6 +1777,7 @@ function renderTxTable(){
     <td style="white-space:normal;max-width:260px;">${escapeHtml(t.concepto)}</td>
     <td class="${t.importe>=0?'pos':'neg'}">${t.importe.toFixed(2)}</td>
     <td>${escapeHtml(t.saldo)}</td>
+    <td><span class="badge ${t._directionKnown?'ok':'warn'}">${escapeHtml(t._directionConfidence||'sin determinar')}</span></td>
     <td>${escapeHtml(t.origen)}</td>
   </tr>`).join('');
   const head = document.getElementById('txSelectAllHead');
@@ -1775,6 +1814,12 @@ function escapeHtml(str){
 document.getElementById('ibanInput').addEventListener('keydown', e=>{ if(e.key==='Enter') checkIban(); });
 document.getElementById('cardInput').addEventListener('keydown', e=>{ if(e.key==='Enter') checkCard(); });
 document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeMovementDetail(); });
+const bankDropZone=document.getElementById('bankDropZone');
+if(bankDropZone){
+  ['dragenter','dragover'].forEach(type=>bankDropZone.addEventListener(type,e=>{e.preventDefault();e.stopPropagation();bankDropZone.style.borderColor='var(--rastro-active)';}));
+  ['dragleave','drop'].forEach(type=>bankDropZone.addEventListener(type,e=>{e.preventDefault();e.stopPropagation();bankDropZone.style.borderColor='';}));
+  bankDropZone.addEventListener('drop',e=>{const file=e.dataTransfer?.files?.[0];if(file)handleBankFile(file);});
+}
 </script>
 </body>
 </html>
