@@ -286,7 +286,7 @@ tr.clk{cursor:pointer;}
     <!-- BIN -->
     <div class="view" id="v-bin">
       <h1>BIN / Tarjetas</h1>
-      <p class="lede">Identifica la <b>entidad emisora</b> de una tarjeta a partir de su BIN (6-8 primeros dígitos) con una base incrustada de casi 240.000 prefijos, sin conexión. También valida el número con el algoritmo de Luhn, detecta la red por rango IIN público e indica la entidad actual cuando el emisor español fue absorbido.</p>
+      <p class="lede">Identifica la <b>entidad emisora</b> de una tarjeta a partir de su BIN (6-8 primeros dígitos) con una base incrustada de casi 240.000 prefijos, sin conexión, y contrástala si quieres con fuentes en línea (HandyAPI, Binlist, CardBinCheck) enviando solo el BIN. También valida el número con el algoritmo de Luhn, detecta la red por rango IIN público e indica la entidad actual cuando el emisor español fue absorbido.</p>
 
       <div class="panel">
         <div class="row">
@@ -1278,10 +1278,186 @@ async function checkCard(){
     html += `<div class="note">${BINDB.state === 'error' ? 'No se pudo cargar la base BIN incrustada (' + escapeHtml(BINDB.error) + ').' : 'Este BIN no figura en la base incrustada' + (binTable.length ? ' ni en tu tabla' : '') + '.'} Prueba con la consulta en línea o carga un CSV propio.</div>`;
   }
   const bin6 = digitsOnly.slice(0, Math.min(8, Math.max(6, (r && r.prefijo.length) || 6)));
-  html += `<div class="note">Consulta en línea (solo se envía el BIN <b>${escapeHtml(bin6)}</b>, nunca el número completo; se abre únicamente al pulsar):
-    <a class="lnk" href="https://lookup.binlist.net/${encodeURIComponent(bin6)}" target="_blank" rel="noopener noreferrer">binlist.net</a>
-    <a class="lnk" href="https://bincheck.io/details/${encodeURIComponent(digitsOnly.slice(0, 6))}" target="_blank" rel="noopener noreferrer">bincheck.io</a></div>`;
+  html += `<div class="hr"></div><div class="note" style="border:none;padding:0;margin-bottom:8px;"><b>Fuentes en línea</b> (HandyAPI, Binlist, CardBinCheck): solo se envía el BIN <b>${escapeHtml(bin6)}</b>, nunca el número completo, y únicamente al pulsar.
+    También puedes abrir <a class="lnk" href="https://bincheck.io/details/${encodeURIComponent(digitsOnly.slice(0, 6))}" target="_blank" rel="noopener noreferrer">bincheck.io</a>.</div><div id="binOnlineBox"></div>`;
   box.innerHTML = html;
+  binOnlineState = { bin: bin6, base: r, results: [] };
+  renderBinOnline();
+}
+
+/* ---------- consulta BIN en línea (opcional; solo envía el BIN, nunca el número completo) ----------
+ * Cascada de fuentes: si una falla (CORS, límite de peticiones, sin datos) se prueba la siguiente.
+ * Binlist limita a pocas consultas por hora y bloquea CORS al abrir el archivo como file://,
+ * por eso se intenta también a través de proxies y se ofrece la importación manual del JSON. */
+const BIN_ONLINE_BINLIST = 'https://lookup.binlist.net/';
+async function binFetchJson(url, timeout = 7000){
+  const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), timeout);
+  try{
+    const res = await fetch(url, { signal: ctl.signal });            // sin cabeceras propias: evita el preflight CORS
+    if(!res.ok) throw new Error('HTTP ' + res.status);
+    return await res.json();
+  } catch(e){ throw new Error(e.name === 'AbortError' ? 'tiempo agotado' : (e.message || String(e))); }
+  finally{ clearTimeout(t); }
+}
+function binOnlineValid(d){ return !!(d && (d.emisor || d.marca || d.tipo || d.pais)); }
+function binFromBinlist(j){
+  const b = (j && j.bank) || {}, c = (j && j.country) || {}, n = (j && j.number) || {};
+  return { marca: j && j.scheme ? String(j.scheme).toUpperCase() : '', tipo: (j && j.type) || '', categoria: (j && j.brand) || '',
+    prepago: j && typeof j.prepaid === 'boolean' ? j.prepaid : null,
+    emisor: b.name || '', web: b.url || '', telefono: b.phone || '', ciudad: b.city || '', pais: String(c.alpha2 || '').toUpperCase(), divisa: c.currency || '',
+    longitud: n.length || '', luhn: typeof n.luhn === 'boolean' ? n.luhn : null };
+}
+const binProxy = {
+  codetabs: u => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(u),
+  allorigins: u => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u)
+};
+const BIN_ONLINE_PROVIDERS = [
+  { id: 'handyapi', name: 'HandyAPI', run: async bin => {
+      const url = 'https://data.handyapi.com/bin/' + bin.slice(0, 6);
+      const raw = await binFetchJson(url);
+      if(raw.Status !== 'SUCCESS') throw new Error('no encontrado');
+      const c = raw.Country || {};
+      return { url, raw, bin6: true, data: { marca: raw.Scheme ? String(raw.Scheme).toUpperCase() : '', tipo: raw.Type || '', categoria: raw.CardTier || '', prepago: null,
+        emisor: raw.Issuer || '', web: '', telefono: '', ciudad: '', pais: String(c.A2 || '').toUpperCase(), divisa: '', longitud: '', luhn: null } };
+    } },
+  { id: 'binlist', name: 'Binlist', run: async bin => {
+      const url = BIN_ONLINE_BINLIST + bin, raw = await binFetchJson(url);
+      return { url, raw, data: binFromBinlist(raw) };
+    } },
+  { id: 'binlist-codetabs', name: 'Binlist (vía CodeTabs)', group: 'binlist', run: async bin => {
+      const url = BIN_ONLINE_BINLIST + bin, raw = await binFetchJson(binProxy.codetabs(url));
+      return { url, raw, data: binFromBinlist(raw) };
+    } },
+  { id: 'binlist-allorigins', name: 'Binlist (vía AllOrigins)', group: 'binlist', run: async bin => {
+      const url = BIN_ONLINE_BINLIST + bin, raw = await binFetchJson(binProxy.allorigins(url));
+      return { url, raw, data: binFromBinlist(raw) };
+    } },
+  { id: 'cardbincheck', name: 'CardBinCheck (vía CodeTabs)', run: async bin => {
+      const url = 'https://cardbincheck.com/api/bin/' + bin.slice(0, 6), raw = await binFetchJson(binProxy.codetabs(url));
+      const r = raw && raw.data;
+      if(!raw || !raw.success || !r) throw new Error('no encontrado');
+      return { url, raw, bin6: true, data: { marca: r.scheme ? String(r.scheme).toUpperCase() : '', tipo: r.funding || '', categoria: r.segment || '',
+        prepago: /prepaid/i.test(r.funding || '') ? true : null, emisor: r.issuer || '', web: r.bank_url || '', telefono: r.bank_phone || '', ciudad: '',
+        pais: String(r.country_code || '').toUpperCase(), divisa: '', longitud: '', luhn: null } };
+    } }
+];
+/* all=false: se detiene en la primera fuente con datos. all=true: contrasta todas
+ * (los proxies de Binlist solo se usan si Binlist directo ha fallado). */
+async function binOnlineQuery(bin, all, onProgress){
+  const out = [];
+  let binlistOk = false;
+  for(const p of BIN_ONLINE_PROVIDERS){
+    if(p.group === 'binlist' && binlistOk) continue;
+    if(onProgress) onProgress(p);
+    try{
+      const r = await p.run(bin);
+      if(!binOnlineValid(r.data)) throw new Error('respuesta sin datos');
+      out.push(Object.assign({ ok: true, provider: p, fecha: new Date().toISOString() }, r));
+      if(p.id === 'binlist' || p.group === 'binlist') binlistOk = true;
+      if(!all) break;
+    } catch(e){ out.push({ ok: false, provider: p, error: e.message || String(e) }); }
+  }
+  return out;
+}
+function binNormIssuer(s){
+  return String(s || '').toUpperCase().normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/\b(S\.?A\.?U?|S\.?L\.?|SAU|LTD|PLC|INC|CORP|AG|N\.?A\.?|BANCO|BANK|THE|DE|DEL|LA|EL|Y|AND)\b/g, ' ')
+    .replace(/[^A-Z0-9]+/g, ' ').trim();
+}
+function binSameIssuer(a, b){
+  const x = binNormIssuer(a), y = binNormIssuer(b);
+  if(!x || !y) return null;
+  if(x === y || x.includes(y) || y.includes(x)) return true;
+  const wx = new Set(x.split(' ').filter(w => w.length > 2));
+  return y.split(' ').some(w => w.length > 2 && wx.has(w));
+}
+
+let binOnlineState = { bin: '', base: null, results: [] };
+async function binOnlineRun(all){
+  const st = binOnlineState, box = document.getElementById('binOnlineBox');
+  if(!st.bin || !box) return;
+  box.querySelectorAll('button').forEach(b => b.disabled = true);
+  const msg = document.getElementById('binOnlineMsg');
+  st.results = await binOnlineQuery(st.bin, all, p => { if(msg) msg.innerHTML = `<span class="badge warn">consultando</span> ${escapeHtml(p.name)}…`; });
+  renderBinOnline();
+}
+function binOnlineImportManual(){
+  const st = binOnlineState, ta = document.getElementById('binOnlineJson'), msg = document.getElementById('binOnlineManualMsg');
+  let j;
+  try{ j = JSON.parse(ta.value.trim()); } catch(e){ msg.innerHTML = '<span class="badge bad">El texto pegado no es un JSON válido.</span>'; return; }
+  const data = binFromBinlist(j);
+  if(!binOnlineValid(data)){ msg.innerHTML = '<span class="badge bad">El JSON no contiene datos de BIN reconocibles (formato Binlist).</span>'; return; }
+  st.results = st.results.filter(r => r.provider.id !== 'manual').concat([{ ok: true, provider: { id: 'manual', name: 'Binlist (importación manual)' },
+    url: BIN_ONLINE_BINLIST + st.bin, raw: j, data, fecha: new Date().toISOString() }]);
+  renderBinOnline();
+}
+function renderBinOnline(){
+  const st = binOnlineState, box = document.getElementById('binOnlineBox');
+  if(!box) return;
+  const ok = st.results.filter(r => r.ok), fail = st.results.filter(r => !r.ok);
+  let h = `<div class="row" style="gap:10px;align-items:center;margin-bottom:8px;">
+    <button class="btn small" onclick="binOnlineRun(false)">Consultar en línea</button>
+    <button class="btn ghost small" onclick="binOnlineRun(true)">Contrastar todas las fuentes</button>
+    ${ok.length ? '<button class="btn ghost small" onclick="binOnlineExport()">Descargar informe JSON</button>' : ''}
+    <span id="binOnlineMsg" class="note" style="border:none;padding:0;"></span></div>`;
+  if(ok.length){
+    h += '<div class="tablewrap"><table><thead><tr><th>Fuente</th><th>Entidad emisora</th><th>¿Coincide con la base?</th><th>Red</th><th>Tipo</th><th>Producto</th><th>País</th><th>Web / teléfono</th></tr></thead><tbody>';
+    ok.forEach(r => {
+      const d = r.data, same = st.base && st.base.emisor ? binSameIssuer(d.emisor, st.base.emisor) : null;
+      const cmp = same === null ? '—' : (same ? '<span class="badge ok">sí</span>' : '<span class="badge warn">distinta</span>');
+      h += `<tr><td style="font-family:var(--sans);"><a class="lnk" href="${escapeHtml(r.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(r.provider.name)}</a>${r.bin6 && st.bin.length > 6 ? ' <span class="tag">BIN 6</span>' : ''}</td>` +
+        `<td style="font-family:var(--sans);white-space:normal;min-width:180px;"><b>${escapeHtml(d.emisor || '—')}</b>${d.ciudad ? ' · ' + escapeHtml(d.ciudad) : ''}</td>` +
+        `<td>${cmp}</td><td>${escapeHtml(d.marca || '—')}</td><td style="font-family:var(--sans);">${escapeHtml(binTipoEs(d.tipo) || '—')}${d.prepago ? ' <span class="badge warn">prepago</span>' : ''}</td>` +
+        `<td style="font-family:var(--sans);">${escapeHtml(d.categoria || '—')}</td><td>${d.pais ? escapeHtml(countryName(d.pais)) + ' (' + escapeHtml(d.pais) + ')' : '—'}${d.divisa ? ' · ' + escapeHtml(d.divisa) : ''}</td>` +
+        `<td style="white-space:normal;">${escapeHtml([d.web, d.telefono].filter(Boolean).join(' · ') || '—')}</td></tr>`;
+    });
+    h += '</tbody></table></div>';
+    const names = new Set(ok.map(r => binNormIssuer(r.data.emisor)).filter(Boolean));
+    if(names.size > 1) h += '<div class="flag"><span class="flagicon">! </span><span>Las fuentes en línea no coinciden en la entidad emisora. Los rangos BIN se reasignan (fusiones, cambios de procesador): confirma con la marca de la tarjeta o con la entidad antes del requerimiento.</span></div>';
+    else if(st.base && st.base.emisor && ok.some(r => binSameIssuer(r.data.emisor, st.base.emisor) === false)) h += `<div class="flag"><span class="flagicon">! </span><span>La fuente en línea indica una entidad distinta a la de la base incrustada (datos de ${escapeHtml(BIN_DB_META.fecha)}). La fuente en línea suele ser más reciente, pero conviene confirmarlo.</span></div>`;
+  }
+  if(fail.length) h += `<div class="note">Sin respuesta útil: ${fail.map(r => escapeHtml(r.provider.name) + ' (' + escapeHtml(r.error) + ')').join(' · ')}${location.protocol === 'file:' ? '. Al abrir la herramienta como archivo local (file://) algunos servidores bloquean la petición por CORS: usa la importación manual o sirve la página por http.' : ''}</div>`;
+  h += `<details style="margin-top:8px;"${st.results.length && !ok.length ? ' open' : ''}><summary>Importar respuesta manual de Binlist</summary>
+    <p class="note" style="border:none;padding:0;margin:6px 0;">Abre <a class="lnk" href="${BIN_ONLINE_BINLIST + encodeURIComponent(st.bin)}" target="_blank" rel="noopener noreferrer">${BIN_ONLINE_BINLIST + escapeHtml(st.bin)}</a> en otra pestaña y pega aquí la respuesta JSON.</p>
+    <textarea id="binOnlineJson" spellcheck="false" style="min-height:80px;" placeholder='{"scheme":"mastercard","type":"debit","bank":{"name":"..."}}'></textarea>
+    <div style="margin-top:6px;"><button class="btn ghost small" onclick="binOnlineImportManual()">Mostrar datos</button> <span id="binOnlineManualMsg"></span></div></details>`;
+  if(ok.length) h += `<details style="margin-top:4px;"><summary>Ver respuestas JSON originales</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:300px;overflow:auto;">${escapeHtml(ok.map(r => '// ' + r.provider.name + ' · ' + r.url + '\n' + JSON.stringify(r.raw, null, 2)).join('\n\n'))}</pre></details>`;
+  box.innerHTML = h;
+}
+function binOnlineExport(){
+  const st = binOnlineState, b = st.base;
+  const rep = { herramienta: 'RASTRO FININT · BIN', bin: st.bin, fecha_utc: new Date().toISOString(),
+    base_incrustada: b ? { prefijo: b.prefijo, emisor: b.emisor, pais: b.pais, tipo: b.tipo, fuente: b.fuente === 'propia' ? 'tabla propia' : BIN_DB_META.fuente } : null,
+    consultas: st.results.map(r => r.ok ? { proveedor: r.provider.name, origen: r.url, fecha_utc: r.fecha, datos: r.data, respuesta: r.raw } : { proveedor: r.provider.name, error: r.error }) };
+  downloadBlob('rastro-bin-' + st.bin + '.json', JSON.stringify(rep, null, 2), 'application/json');
+}
+
+/* ---------- análisis masivo: completar en línea ---------- */
+let binBulkOnlineBusy = false, binBulkOnlineText = '';
+function binBulkKey(b){ return b.x.digits.slice(0, Math.min(8, Math.max(6, (b.r && b.r.prefijo && b.r.prefijo.length) || 6))); }
+async function bulkCardsOnline(onlyMissing){
+  if(binBulkOnlineBusy || !binBulkRows.length) return;
+  const target = binBulkRows.filter(b => !onlyMissing || !(b.r && b.r.emisor));
+  const bins = [...new Set(target.map(binBulkKey))];
+  if(!bins.length){ alert('Todas las tarjetas tienen ya entidad emisora en la base.'); return; }
+  if(!confirm(`Se consultarán ${bins.length} BIN en servicios externos (HandyAPI, Binlist, CardBinCheck…). Solo se envía el BIN, nunca el número completo. ¿Continuar?`)) return;
+  binBulkOnlineBusy = true;
+  let hits = 0;
+  try{
+    for(let i = 0; i < bins.length; i++){
+      binBulkOnlineText = `Consultando ${i + 1}/${bins.length} (${bins[i]})…`;
+      const res = await binOnlineQuery(bins[i], false);
+      const best = res.find(r => r.ok) || { ok: false, error: res.map(r => r.provider.name + ': ' + r.error).join('; ') };
+      if(best.ok) hits++;
+      target.forEach(b => { if(binBulkKey(b) === bins[i]) b.online = best; });
+      renderBulkCards();
+      if(i < bins.length - 1) await new Promise(r => setTimeout(r, 800));
+    }
+  } finally {
+    binBulkOnlineBusy = false;
+    binBulkOnlineText = `Consulta en línea terminada: ${hits}/${bins.length} BIN con datos.`;
+    renderBulkCards();
+  }
 }
 
 /* ---------- análisis masivo: extrae números de tarjeta (completos o enmascarados) de un texto ---------- */
@@ -1320,19 +1496,24 @@ function renderBulkCards(){
   if(!binBulkRows.length){ box.innerHTML = '<div class="note">No se han encontrado números de tarjeta ni BIN en el texto.</div>'; return; }
   const issuers = new Set(binBulkRows.map(r => r.r && r.r.emisor).filter(Boolean)).size;
   const bad = binBulkRows.filter(r => r.luhn === false).length, pre = binBulkRows.filter(r => binPrepago(r.r)).length;
-  let h = `<div class="row" style="margin:8px 0;gap:10px;align-items:center;"><span class="tag">${binBulkRows.length} tarjetas distintas</span><span class="tag">${issuers} emisores</span><span class="tag">${bad} con Luhn no válido</span><span class="tag">${pre} prepago</span><button class="btn ghost small" onclick="exportBulkCards()">Exportar CSV</button></div>`;
-  h += '<div class="tablewrap" style="max-height:360px;"><table><thead><tr><th>#</th><th>Tarjeta</th><th>Red</th><th>Luhn</th><th>BIN</th><th>Emisor</th><th>Entidad actual</th><th>País</th><th>Tipo</th><th>Apariciones</th></tr></thead><tbody>';
+  let h = `<div class="row" style="margin:8px 0;gap:10px;align-items:center;"><span class="tag">${binBulkRows.length} tarjetas distintas</span><span class="tag">${issuers} emisores</span><span class="tag">${bad} con Luhn no válido</span><span class="tag">${pre} prepago</span><button class="btn ghost small" onclick="exportBulkCards()">Exportar CSV</button>` +
+    `<button class="btn ghost small" onclick="bulkCardsOnline(true)" ${binBulkOnlineBusy ? 'disabled' : ''}>Completar en línea los BIN sin emisor</button><button class="btn ghost small" onclick="bulkCardsOnline(false)" ${binBulkOnlineBusy ? 'disabled' : ''}>Consultar todos en línea</button>` +
+    `<span class="note" style="border:none;padding:0;">${escapeHtml(binBulkOnlineText)}</span></div>`;
+  h += '<div class="tablewrap" style="max-height:360px;"><table><thead><tr><th>#</th><th>Tarjeta</th><th>Red</th><th>Luhn</th><th>BIN</th><th>Emisor</th><th>Entidad actual</th><th>Emisor en línea</th><th>País</th><th>Tipo</th><th>Apariciones</th></tr></thead><tbody>';
   binBulkRows.forEach((b, i) => {
     const r = b.r || {};
     h += `<tr><td>${i + 1}</td><td>${escapeHtml(b.shown)}</td><td style="font-family:var(--sans);">${escapeHtml(b.red || '—')}</td><td>${b.luhn === null ? '—' : badgeOk(b.luhn, 'sí', 'no')}</td><td>${escapeHtml(r.prefijo || '')}</td>` +
       `<td style="font-family:var(--sans);white-space:normal;min-width:180px;">${escapeHtml(r.emisor || '—')}${r.reconstruido ? ' <span class="badge warn">reconstruido</span>' : ''}${binEsTecnico(r) ? ' <span class="badge warn">procesador</span>' : ''}</td>` +
-      `<td style="font-family:var(--sans);">${escapeHtml(b.act ? b.act.actual : '')}</td><td>${escapeHtml(r.pais || '')}</td><td style="font-family:var(--sans);">${escapeHtml(binTipoEs(r.tipo))}${binPrepago(r) ? ' <span class="badge warn">prepago</span>' : ''}</td><td>${b.x.n}</td></tr>`;
+      `<td style="font-family:var(--sans);">${escapeHtml(b.act ? b.act.actual : '')}</td>` +
+      `<td style="font-family:var(--sans);white-space:normal;min-width:160px;">${!b.online ? '' : (b.online.ok ? escapeHtml(b.online.data.emisor || '—') + ' <span class="tag">' + escapeHtml(b.online.provider.name) + '</span>' + (r.emisor && b.online.data.emisor && binSameIssuer(r.emisor, b.online.data.emisor) === false ? ' <span class="badge warn">distinta</span>' : '') : '<span class="badge warn" title="' + escapeHtml(b.online.error) + '">sin datos</span>')}</td>` +
+      `<td>${escapeHtml(r.pais || '')}</td><td style="font-family:var(--sans);">${escapeHtml(binTipoEs(r.tipo))}${binPrepago(r) ? ' <span class="badge warn">prepago</span>' : ''}</td><td>${b.x.n}</td></tr>`;
   });
   box.innerHTML = h + '</tbody></table></div><div class="note">Los números completos se muestran y exportan enmascarados (6 primeros y 4 últimos dígitos).</div>';
 }
 function exportBulkCards(){
-  const head = ['tarjeta_enmascarada', 'red', 'luhn', 'bin', 'emisor', 'nombre_reconstruido', 'entidad_actual', 'pais', 'tipo', 'producto', 'prepago', 'web_emisor', 'telefono_emisor', 'fuente', 'apariciones'];
-  const rows = binBulkRows.map(b => { const r = b.r || {}; return [b.shown, b.red || '', b.luhn === null ? '' : (b.luhn ? 'sí' : 'no'), r.prefijo || '', r.emisor || '', r.reconstruido ? 'sí' : '', b.act ? b.act.actual : '', r.pais || '', binTipoEs(r.tipo), r.categoria || '', binPrepago(r) ? 'sí' : '', r.web || '', r.telefono || '', r.fuente === 'propia' ? 'tabla propia' : (r.fuente ? BIN_DB_META.fuente : ''), b.x.n]; });
+  const head = ['tarjeta_enmascarada', 'red', 'luhn', 'bin', 'emisor', 'nombre_reconstruido', 'entidad_actual', 'pais', 'tipo', 'producto', 'prepago', 'web_emisor', 'telefono_emisor', 'fuente', 'emisor_en_linea', 'pais_en_linea', 'tipo_en_linea', 'fuente_en_linea', 'apariciones'];
+  const rows = binBulkRows.map(b => { const r = b.r || {}; return [b.shown, b.red || '', b.luhn === null ? '' : (b.luhn ? 'sí' : 'no'), r.prefijo || '', r.emisor || '', r.reconstruido ? 'sí' : '', b.act ? b.act.actual : '', r.pais || '', binTipoEs(r.tipo), r.categoria || '', binPrepago(r) ? 'sí' : '', r.web || '', r.telefono || '', r.fuente === 'propia' ? 'tabla propia' : (r.fuente ? BIN_DB_META.fuente : ''),
+    ...(b.online && b.online.ok ? [b.online.data.emisor || '', b.online.data.pais || '', binTipoEs(b.online.data.tipo), b.online.provider.name + ' (' + b.online.url + ')'] : ['', '', '', b.online ? 'sin datos' : '']), b.x.n]; });
   downloadBlob('tarjetas_bin.csv', cryptoCsv([head].concat(rows)), 'text/csv;charset=utf-8');
 }
 function renderBinDbStatus(){
