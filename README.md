@@ -2,7 +2,7 @@
 
 Módulo de investigación financiera del kit **rastro**. Cuatro herramientas para análisis de cuentas bancarias, tarjetas, criptoactivos y trazabilidad de movimientos, pensadas para investigación policial y ciberinteligencia.
 
-**100% del lado del cliente. Sin backend, sin APIs externas, sin telemetría.** Todo el procesamiento ocurre en el navegador de quien lo usa; nada se envía a ningún servidor y nada se persiste entre sesiones.
+**100% del lado del cliente. Sin backend, sin telemetría.** Todo el procesamiento ocurre en el navegador de quien lo usa y nada se persiste entre sesiones. La única excepción es la búsqueda de entidad por BIN, que consulta servicios externos solo cuando se pulsa «Buscar entidad» y envía únicamente el BIN.
 
 **Enlace a la herramienta:** https://s3gad3.github.io/rastro-finint
 
@@ -18,14 +18,12 @@ Las tareas de análisis financiero básico (validar un IBAN, identificar una red
 - Convierte CCC ↔ IBAN.
 
 ### 02 · BIN / Tarjetas
-- **Identifica la entidad emisora a partir del BIN** (6-8 primeros dígitos) con una base incrustada de 238.947 prefijos (159.529 con emisor, 12.496 entidades), sin conexión: emisor, país de emisión, tipo (débito/crédito/prepago), producto, web y teléfono del emisor. Busca siempre el prefijo más largo (8 → 6 → 5 dígitos).
-- Indica la **entidad actual** cuando el emisor español fue absorbido (p. ej. Banco Popular → Santander, Caja Madrid/Bankia → CaixaBank, CatalunyaCaixa → BBVA), que es a quien hay que dirigir el requerimiento.
-- Señala las tarjetas **prepago** y los BIN de **procesadores o entidades centrales** (Servired, Sistema 4B, Euro 6000, Banco Cooperativo…), cuyo emisor real puede ser cualquier entidad adherida.
-- Acepta números completos, **enmascarados** (`454881******1234`) o solo el BIN. Valida el número con el **algoritmo de Luhn** y detecta la red (Visa, Mastercard, Amex, Discover, Diners, JCB, UnionPay, Maestro, Mir) por rango IIN público.
-- **Análisis masivo**: extrae de cualquier texto todos los números de tarjeta (completos o enmascarados) y los BIN sueltos, identifica cada emisor y exporta a CSV. Los números completos se muestran y exportan siempre enmascarados.
-- Permite **cargar un CSV propio de rangos BIN** (columnas `bin`, `entidad`, `pais`, `tipo`), que tiene prioridad sobre la base incrustada.
-- **Consulta en línea opcional** del emisor, solo al pulsar y enviando únicamente el BIN (nunca el número completo). Las fuentes se prueban en cascada hasta obtener datos: HandyAPI → Binlist directo → Binlist vía proxy CodeTabs → Binlist vía proxy AllOrigins → CardBinCheck (vía CodeTabs). «Contrastar todas las fuentes» las consulta todas y las muestra en paralelo, marcando si la entidad coincide con la base incrustada o si las fuentes discrepan. Incluye importación manual del JSON de Binlist (útil al abrir el archivo como `file://`, donde algunos servidores bloquean la petición por CORS), las respuestas originales y un informe JSON descargable.
-- En el análisis masivo, **«Completar en línea los BIN sin emisor»** (o «Consultar todos en línea») consulta cada BIN distinto una sola vez, añade la columna *Emisor en línea* y la incluye en el CSV exportado.
+- **Busca la entidad emisora a partir del BIN** (al menos los 6 primeros dígitos) en una caja de búsqueda con instrucciones: escribe el BIN o pega el número completo o enmascarado (`454881******1234`) y pulsa **Buscar entidad** (o Intro). Solo se envía el BIN, nunca el número completo, y únicamente al pulsar.
+- Las fuentes en línea se prueban en cascada hasta obtener datos: HandyAPI → Binlist directo → Binlist vía proxy CodeTabs → Binlist vía proxy AllOrigins → CardBinCheck (vía CodeTabs). Resultado: entidad emisora, red, tipo (débito/crédito/prepago), producto, país y web/teléfono del emisor, con la fuente que respondió.
+- **«Contrastar todas las fuentes»** las consulta todas y las muestra en paralelo, avisando si discrepan. Incluye importación manual del JSON de Binlist (útil al abrir el archivo como `file://`, donde algunos servidores bloquean la petición por CORS), las respuestas originales y un informe JSON descargable.
+- **«Solo validar»** comprueba sin conexión el **algoritmo de Luhn** y la red (Visa, Mastercard, Amex, Discover, Diners, JCB, UnionPay, Maestro, Mir) por rango IIN público.
+- **Análisis masivo**: extrae de cualquier texto los números de tarjeta (completos o enmascarados) y los BIN sueltos; «Consultar todos en línea» obtiene la entidad de cada BIN distinto (una consulta por BIN) y se exporta a CSV. Los números completos se muestran y exportan siempre enmascarados.
+- Permite **cargar un CSV propio de rangos BIN** (columnas `bin`, `entidad`, `pais`, `tipo`), que se muestra junto al resultado en línea.
 
 ### 03 · Cripto — BTC / EVM / Tron / LTC / DOGE
 - Verifica formato y checksum de direcciones Bitcoin (Base58Check con SHA-256 vía Web Crypto API, y Bech32/Bech32m incluyendo SegWit v0–v16 y Taproot), EVM (0x + 40 hex, **checksum EIP-55 con Keccak-256 incluido**), Tron, Litecoin y Dogecoin, y reconoce hashes de transacción.
@@ -78,12 +76,11 @@ El resto (IBAN, Luhn, Base58Check, Bech32/Bech32m, Keccak-256, Norma 43, MT940, 
 
 ### Datos incrustados
 
-- **Base BIN**: derivada de [iannuttall/binlist-data](https://github.com/iannuttall/binlist-data), licencia [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/). Se incluye comprimida (gzip + base64, unos 750 KB) y se descomprime en el navegador la primera vez que se usa. La fuente traía un error sistemático que sustituía «L?N» por «lan» en los nombres (`BARCElanA`); 678 nombres se han reconstruido a mano y aparecen marcados como tales en la interfaz.
 - **Base de entidades IBAN**: derivada del proyecto [schwifty](https://github.com/mdomke/schwifty) (MIT).
 
 ## Limitaciones conocidas
 
-- **BIN/tarjetas**: la base incrustada se actualizó por última vez en 2020 y los rangos BIN se reasignan con el tiempo (sobre todo tras fusiones bancarias). La tabla de entidades actuales españolas es orientativa. Confirma siempre el emisor con la marca de tarjeta o con la propia entidad antes de dirigir un requerimiento; si dispones de un listado más reciente, cárgalo como CSV propio.
+- **BIN/tarjetas**: la entidad emisora depende de servicios en línea de terceros (pueden tener límites de consultas o no responder) y los rangos BIN se reasignan con el tiempo, sobre todo tras fusiones bancarias. Confirma siempre el emisor con la marca de tarjeta o con la propia entidad antes de dirigir un requerimiento.
 - **Cripto**: no hay consulta de saldo/histórico en vivo por diseño (sin red). Una dirección EVM escrita toda en minúsculas o toda en mayúsculas no lleva checksum EIP-55, así que solo puede validarse su formato.
 - **MT940**: el campo `:86:` no está normalizado entre bancos; cuando viene en texto libre, el nombre y la cuenta de la contraparte se deducen del concepto igual que en los demás formatos y conviene revisarlos.
 - **CAMT**: los lotes sin importe por operación se muestran como un único movimiento (se avisa en las incidencias de lectura).
